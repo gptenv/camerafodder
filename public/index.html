@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Camera Fodder</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero panel">
+        <div>
+          <p class="eyebrow">Modern random video rooms</p>
+          <h1>Camera Fodder</h1>
+          <p class="lede">Drop into anonymous or signed-in WebRTC video chats, invite random people on demand, and opt into a live global directory while you are online.</p>
+        </div>
+        <div class="status-card">
+          <span id="connectionDot" class="dot"></span>
+          <strong id="sessionName">Not signed in</strong>
+          <small id="sessionId">Use guest mode or local auth to begin.</small>
+        </div>
+      </section>
+
+      <section class="grid">
+        <form id="authForm" class="panel stack">
+          <h2>Start your session</h2>
+          <label>Display name <input id="displayName" maxlength="32" placeholder="Guest name" /></label>
+          <div class="row">
+            <button type="button" id="guestButton">Continue as guest</button>
+            <button type="button" id="signupButton">Create local account</button>
+          </div>
+          <label>Email <input id="email" type="email" placeholder="you@example.com" /></label>
+          <label>Password <input id="password" type="password" placeholder="8+ characters" /></label>
+          <button type="button" id="signinButton">Sign in locally</button>
+          <div class="oauth-row" aria-label="OAuth placeholders">
+            <button type="button" disabled>Google soon</button>
+            <button type="button" disabled>Facebook soon</button>
+            <button type="button" disabled>More providers soon</button>
+          </div>
+        </form>
+
+        <section class="panel stack">
+          <h2>Random room</h2>
+          <label>Preferred room size <input id="roomSize" type="number" min="2" max="8" value="2" /></label>
+          <label class="check"><input id="shareLinks" type="checkbox" /> Enable optional room share link</label>
+          <label class="check"><input id="hostControls" type="checkbox" /> Host controls who can call in new random joiners</label>
+          <button id="startRoomButton">Start / find random chat</button>
+          <button id="addRandomButton" disabled>Call in another random person</button>
+          <p class="hint">Rooms support up to 8 people. Host-control rooms will not be randomly paired with other host-control rooms.</p>
+        </section>
+      </section>
+
+      <section id="roomPanel" class="panel room hidden">
+        <div class="room-header">
+          <div>
+            <p class="eyebrow">Live room</p>
+            <h2 id="roomTitle">No active room</h2>
+            <p id="roomMeta"></p>
+          </div>
+          <div class="row">
+            <button id="copyLinkButton">Copy share link</button>
+            <button id="leaveButton" class="danger">Leave</button>
+          </div>
+        </div>
+        <div id="videos" class="videos"></div>
+        <div class="chat">
+          <div id="messages" class="messages"></div>
+          <form id="chatForm" class="row"><input id="chatInput" placeholder="Say something kind…" /><button>Send</button></form>
+        </div>
+      </section>
+
+      <section class="panel stack">
+        <div class="directory-head">
+          <div>
+            <p class="eyebrow">Global Directory</p>
+            <h2>Online phone book for video chats</h2>
+          </div>
+          <label class="check"><input id="directoryOptIn" type="checkbox" /> List me while online</label>
+        </div>
+        <div id="directory" class="directory"></div>
+      </section>
+    </main>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
