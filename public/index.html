@@ -7,7 +7,7 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <main class="shell">
+    <main id="lobbyView" class="shell">
       <section class="hero panel">
         <div>
           <p class="eyebrow">Modern random video rooms</p>
@@ -18,6 +18,7 @@
           <span id="connectionDot" class="dot"></span>
           <strong id="sessionName">Not signed in</strong>
           <small id="sessionId">Use guest mode or local auth to begin.</small>
+          <button type="button" id="logoutButton" class="secondary hidden">Sign out</button>
         </div>
       </section>
 
@@ -32,6 +33,7 @@
           <label>Email <input id="email" type="email" placeholder="you@example.com" /></label>
           <label>Password <input id="password" type="password" placeholder="8+ characters" /></label>
           <button type="button" id="signinButton">Sign in locally</button>
+          <p id="authStatus" class="hint">Use guest mode, or create/sign into a local account.</p>
           <div class="oauth-row" aria-label="OAuth placeholders">
             <button type="button" disabled>Google soon</button>
             <button type="button" disabled>Facebook soon</button>
@@ -45,41 +47,117 @@
           <label class="check"><input id="shareLinks" type="checkbox" /> Enable optional room share link</label>
           <label class="check"><input id="hostControls" type="checkbox" /> Host controls who can call in new random joiners</label>
           <button id="startRoomButton">Start / find random chat</button>
-          <button id="addRandomButton" disabled>Call in another random person</button>
           <p class="hint">Rooms support up to 8 people. Host-control rooms will not be randomly paired with other host-control rooms.</p>
         </section>
       </section>
 
-      <section id="roomPanel" class="panel room hidden">
-        <div class="room-header">
-          <div>
-            <p class="eyebrow">Live room</p>
-            <h2 id="roomTitle">No active room</h2>
-            <p id="roomMeta"></p>
+      <section class="grid request-grid">
+        <section class="panel stack">
+          <div class="directory-head">
+            <div>
+              <p class="eyebrow">Global Directory</p>
+              <h2>Online phone book for video chats</h2>
+            </div>
+            <label class="check"><input id="directoryOptIn" type="checkbox" /> List me while online</label>
           </div>
-          <div class="row">
-            <button id="copyLinkButton">Copy share link</button>
-            <button id="leaveButton" class="danger">Leave</button>
-          </div>
-        </div>
-        <div id="videos" class="videos"></div>
-        <div class="chat">
-          <div id="messages" class="messages"></div>
-          <form id="chatForm" class="row"><input id="chatInput" placeholder="Say something kind…" /><button>Send</button></form>
-        </div>
-      </section>
-
-      <section class="panel stack">
-        <div class="directory-head">
-          <div>
-            <p class="eyebrow">Global Directory</p>
-            <h2>Online phone book for video chats</h2>
-          </div>
-          <label class="check"><input id="directoryOptIn" type="checkbox" /> List me while online</label>
-        </div>
-        <div id="directory" class="directory"></div>
+          <p id="directoryStatus" class="hint">Requests are checked quietly in the background.</p>
+          <div id="directory" class="directory"></div>
+        </section>
       </section>
     </main>
+
+    <main id="inviteView" class="invite-shell hidden">
+      <section class="invite-card panel">
+        <div>
+          <p class="eyebrow">Room invite</p>
+          <h1 id="inviteRoomTitle">Request to join</h1>
+          <p id="inviteStatus" class="lede">Choose a name, start a session, then send a request to the people already in this room.</p>
+        </div>
+
+        <section class="invite-grid">
+          <form id="inviteAuthForm" class="stack">
+            <h2>Join as yourself</h2>
+            <label>Display name <input id="inviteDisplayName" maxlength="32" placeholder="Your room name" /></label>
+            <div class="row">
+              <button type="button" id="inviteGuestButton">Continue as guest</button>
+              <button type="button" id="inviteSignupButton">Create local account</button>
+            </div>
+            <label>Email <input id="inviteEmail" type="email" placeholder="you@example.com" /></label>
+            <label>Password <input id="invitePassword" type="password" placeholder="8+ characters" /></label>
+            <button type="button" id="inviteSigninButton" class="secondary">Sign in locally</button>
+          </form>
+
+          <section class="invite-request stack">
+            <h2>Ask to enter</h2>
+            <div class="status-card">
+              <span id="inviteConnectionDot" class="dot"></span>
+              <strong id="inviteSessionName">Not signed in</strong>
+              <small id="inviteSessionId">Start a guest or local account session first.</small>
+              <button type="button" id="inviteLogoutButton" class="secondary hidden">Sign out</button>
+            </div>
+            <button id="inviteRequestButton" disabled>Request to join</button>
+            <button id="inviteJoinButton" class="hidden">Join room</button>
+            <p class="hint">Requests appear quietly inside the room. Someone already inside can accept you from their join-request panel.</p>
+          </section>
+        </section>
+      </section>
+    </main>
+
+    <section id="roomPanel" class="room-page hidden">
+      <header class="room-topbar">
+        <div>
+          <p class="eyebrow">Live room</p>
+          <h1 id="roomTitle">No active room</h1>
+          <p id="roomMeta"></p>
+        </div>
+        <div class="call-controls">
+          <button id="addRandomButton" disabled>Call in random</button>
+          <button id="copyLinkButton" class="secondary">Copy link</button>
+          <button id="leaveButton" class="danger">Leave</button>
+        </div>
+      </header>
+
+      <main class="conference-layout">
+        <section class="video-stage" aria-label="Video call">
+          <div id="videos" class="videos"></div>
+        </section>
+
+        <aside class="room-sidebar" aria-label="Room tools">
+          <section class="sidebar-card chat-card">
+            <div>
+              <p class="eyebrow">Chat</p>
+              <h2>Room chat</h2>
+            </div>
+            <div id="messages" class="messages"></div>
+            <form id="chatForm" class="chat-form"><input id="chatInput" placeholder="Say something kind…" /><button>Send</button></form>
+          </section>
+
+          <section class="sidebar-card">
+            <div>
+              <p class="eyebrow">People</p>
+              <h2>Attendees</h2>
+            </div>
+            <div id="participants" class="participant-list"></div>
+          </section>
+
+          <section id="requestPanel" class="sidebar-card">
+            <div>
+              <p class="eyebrow">Join Requests</p>
+              <h2>Room requests</h2>
+            </div>
+            <p id="requestStatus" class="hint">Start a session to send and accept requests.</p>
+            <div class="request-section">
+              <h3>Requests to this room</h3>
+              <div id="incomingRequests" class="request-list"></div>
+            </div>
+            <div class="request-section">
+              <h3>Requests you sent</h3>
+              <div id="outgoingRequests" class="request-list"></div>
+            </div>
+          </section>
+        </aside>
+      </main>
+    </section>
     <script type="module" src="/app.js"></script>
   </body>
 </html>

@@ -1,0 +1,25 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: camerafodder
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/maxScale: "3"
+    spec:
+      containerConcurrency: 80
+      containers:
+        - image: IMAGE_PLACEHOLDER
+          ports:
+            - name: http1
+              containerPort: 8080
+          env:
+            - name: RUST_LOG
+              value: info
+            - name: AUTH_STORE_PATH
+              value: /tmp/camerafodder/auth.json
+          resources:
+            limits:
+              cpu: "1"
+              memory: 512Mi

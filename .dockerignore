@@ -1,0 +1,7 @@
+.git
+target
+data
+tmp
+*.log
+Dockerfile
+.dockerignore
