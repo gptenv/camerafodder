@@ -4,11 +4,26 @@ const state = {
   room: null,
   ws: null,
   localStream: null,
+  cameraStream: null,
+  screenStream: null,
   peers: new Map(),
   participants: new Map(),
+  mediaByPeer: new Map(),
   roomEpoch: 0,
   joinRequests: { incoming: [], outgoing: [] },
   pendingRoomId: roomIdFromLocation(),
+  layoutMode: localStorage.getItem('cameraFodderLayout') || 'grid',
+  activeVideoId: 'local',
+  activePanel: 'chat',
+  media: {
+    audioEnabled: true,
+    videoEnabled: true,
+    screenSharing: false,
+    audioDeviceId: localStorage.getItem('cameraFodderAudioDevice') || '',
+    videoDeviceId: localStorage.getItem('cameraFodderVideoDevice') || '',
+    mirrorSelf: localStorage.getItem('cameraFodderMirrorSelf') !== 'false',
+    compactTiles: localStorage.getItem('cameraFodderCompactTiles') === 'true',
+  },
 };
 
 const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
@@ -118,20 +133,117 @@ function isActiveRoom(roomId, roomEpoch) {
   return state.room?.id === roomId && state.roomEpoch === roomEpoch;
 }
 
+function setRoomNotice(message) {
+  if ($('roomNotice')) $('roomNotice').textContent = message;
+}
+
+function setLaunchStatus(message) {
+  if ($('roomLaunchStatus')) $('roomLaunchStatus').textContent = message;
+}
+
+function currentPresence() {
+  return {
+    audio_enabled: state.media.audioEnabled,
+    video_enabled: state.media.screenSharing || state.media.videoEnabled,
+    screen_sharing: state.media.screenSharing,
+  };
+}
+
+function broadcastPresence() {
+  if (!state.room || !state.session) return;
+  const presence = currentPresence();
+  state.mediaByPeer.set(state.session.id, presence);
+  updateVideoCardState('local', presence);
+  renderParticipants();
+  send({
+    type: 'presence',
+    audioEnabled: presence.audio_enabled,
+    videoEnabled: presence.video_enabled,
+    screenSharing: presence.screen_sharing,
+  });
+}
+
+function mediaConstraints() {
+  const audio = state.media.audioDeviceId
+    ? { deviceId: { exact: state.media.audioDeviceId }, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    : { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
+  const video = state.media.videoDeviceId
+    ? { deviceId: { exact: state.media.videoDeviceId }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 } }
+    : { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 } };
+  return { audio, video };
+}
+
+async function restartCameraStream() {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    throw new Error('This browser does not expose camera and microphone devices.');
+  }
+  const previous = state.cameraStream;
+  const stream = await navigator.mediaDevices.getUserMedia(mediaConstraints());
+  state.cameraStream = stream;
+  applyMediaPreferences();
+  rebuildLocalStream();
+  previous?.getTracks().forEach((track) => track.stop());
+  await refreshDeviceLists();
+}
+
+function applyMediaPreferences() {
+  state.cameraStream?.getAudioTracks().forEach((track) => {
+    track.enabled = state.media.audioEnabled;
+  });
+  state.cameraStream?.getVideoTracks().forEach((track) => {
+    track.enabled = state.media.videoEnabled;
+  });
+}
+
+function activeAudioTrack() {
+  return state.cameraStream?.getAudioTracks()[0] || null;
+}
+
+function activeVideoTrack() {
+  if (state.media.screenSharing) return state.screenStream?.getVideoTracks()[0] || null;
+  return state.cameraStream?.getVideoTracks()[0] || null;
+}
+
+function composeLocalStream() {
+  const tracks = [];
+  const audioTrack = activeAudioTrack();
+  const videoTrack = activeVideoTrack();
+  if (audioTrack) tracks.push(audioTrack);
+  if (videoTrack) tracks.push(videoTrack);
+  return new MediaStream(tracks);
+}
+
+function replaceOutgoingTrack(kind, track) {
+  state.peers.forEach(({ pc }) => {
+    const sender = pc.getSenders().find((candidate) => candidate.track?.kind === kind);
+    if (sender) sender.replaceTrack(track).catch(console.warn);
+  });
+}
+
+function rebuildLocalStream() {
+  if (!state.cameraStream && !state.screenStream) return;
+  state.localStream = composeLocalStream();
+  upsertVideo('local', state.localStream, `${state.session.display_name} (you)`, true);
+  replaceOutgoingTrack('audio', activeAudioTrack());
+  replaceOutgoingTrack('video', activeVideoTrack());
+  updateControlStates();
+  broadcastPresence();
+}
+
 async function ensureMedia(roomEpoch = state.roomEpoch) {
   const roomId = state.room?.id;
   if (!roomId || !isActiveRoom(roomId, roomEpoch)) {
     throw new Error('No active room needs media.');
   }
-  if (!state.localStream) {
-    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+  if (!state.cameraStream) {
+    setRoomNotice('Requesting camera and microphone access...');
+    await restartCameraStream();
     if (!isActiveRoom(roomId, roomEpoch)) {
-      stream.getTracks().forEach((track) => track.stop());
+      stopLocalMedia();
       throw new Error('Room left before media started.');
     }
-    state.localStream = stream;
-    upsertVideo('local', state.localStream, `${state.session.display_name} (you)`, true);
   }
+  if (!state.localStream) rebuildLocalStream();
   return state.localStream;
 }
 
@@ -141,8 +253,11 @@ function upsertVideo(id, stream, label, muted = false) {
   video.srcObject = stream;
   video.muted = muted;
   card.querySelector('.badge').textContent = label;
+  card.querySelector('.tile-avatar').dataset.initials = initials(label);
   card.querySelector('.video-state').textContent = '';
   card.classList.remove('waiting');
+  updateVideoCardState(id, id === 'local' ? currentPresence() : state.mediaByPeer.get(id));
+  updateVideoLayout();
 }
 
 function ensureVideoCard(id, label) {
@@ -151,22 +266,246 @@ function ensureVideoCard(id, label) {
     card = document.createElement('div');
     card.className = 'video-card waiting';
     card.dataset.videoId = id;
-    card.innerHTML = '<video autoplay playsinline></video><span class="badge"></span><span class="video-state">Connecting...</span>';
+    if (id === 'local') card.classList.add('local-card');
+    card.innerHTML = `
+      <video autoplay playsinline></video>
+      <span class="tile-scrim"></span>
+      <span class="tile-avatar" data-initials=""></span>
+      <span class="tile-top"><span class="tile-state">Connecting</span></span>
+      <span class="tile-bottom"><span class="badge"></span><span class="tile-media">Live</span></span>
+      <span class="video-state">Connecting...</span>
+    `;
+    card.onclick = () => {
+      state.activeVideoId = id;
+      setLayoutMode('focus');
+    };
     $('videos').append(card);
   }
   card.querySelector('.badge').textContent = label;
+  card.querySelector('.tile-avatar').dataset.initials = initials(label);
+  if (id === 'local') card.classList.add('local-card');
+  updateVideoCardState(id, id === 'local' ? currentPresence() : state.mediaByPeer.get(id));
+  updateVideoLayout();
   return card;
 }
 
 function removeVideo(id) {
   document.querySelector(`[data-video-id="${id}"]`)?.remove();
+  if (state.activeVideoId === id) state.activeVideoId = 'local';
+  updateVideoLayout();
 }
 
 function stopLocalMedia() {
+  state.cameraStream?.getTracks().forEach((track) => track.stop());
+  state.screenStream?.getTracks().forEach((track) => track.stop());
   state.localStream?.getTracks().forEach((track) => track.stop());
+  state.cameraStream = null;
+  state.screenStream = null;
   state.localStream = null;
+  state.media.screenSharing = false;
   const localVideo = document.querySelector('[data-video-id="local"] video');
   if (localVideo) localVideo.srcObject = null;
+  updateControlStates();
+}
+
+function initials(label) {
+  const clean = label.replace(/\(you\)/i, '').trim();
+  const parts = clean.split(/\s+/).filter(Boolean).slice(0, 2);
+  return (parts.map((part) => part[0]).join('') || 'CF').toUpperCase();
+}
+
+function updateVideoCardState(id, presence = {}) {
+  const card = document.querySelector(`[data-video-id="${id}"]`);
+  if (!card) return;
+  const resolved = {
+    audio_enabled: presence.audio_enabled !== false,
+    video_enabled: presence.video_enabled !== false,
+    screen_sharing: presence.screen_sharing === true,
+  };
+  card.classList.toggle('mic-muted', !resolved.audio_enabled);
+  card.classList.toggle('camera-off', !resolved.video_enabled);
+  card.classList.toggle('screen-sharing', resolved.screen_sharing);
+  card.classList.toggle('mirror-self', id === 'local' && state.media.mirrorSelf);
+  const media = card.querySelector('.tile-media');
+  if (media) {
+    if (resolved.screen_sharing) media.textContent = 'Sharing screen';
+    else if (!resolved.audio_enabled && !resolved.video_enabled) media.textContent = 'Muted, camera off';
+    else if (!resolved.audio_enabled) media.textContent = 'Muted';
+    else if (!resolved.video_enabled) media.textContent = 'Camera off';
+    else media.textContent = 'Live';
+  }
+  const tileState = card.querySelector('.tile-state');
+  if (tileState) {
+    tileState.textContent = resolved.screen_sharing
+      ? 'Screen share'
+      : resolved.video_enabled
+        ? 'Connecting'
+        : 'Camera off';
+  }
+}
+
+function updateVideoLayout() {
+  const videos = $('videos');
+  if (!videos) return;
+  const cards = [...videos.querySelectorAll('.video-card')];
+  videos.dataset.count = String(cards.length);
+  videos.classList.toggle('focus-layout', state.layoutMode === 'focus' && cards.length > 1);
+  videos.classList.toggle('grid-layout', state.layoutMode !== 'focus' || cards.length <= 1);
+  videos.classList.toggle('compact-layout', state.media.compactTiles);
+  if (!cards.some((card) => card.dataset.videoId === state.activeVideoId)) {
+    state.activeVideoId = cards[0]?.dataset.videoId || 'local';
+  }
+  for (const card of cards) {
+    card.classList.toggle('is-active', state.layoutMode === 'focus' && card.dataset.videoId === state.activeVideoId);
+  }
+  updateControlStates();
+}
+
+function setLayoutMode(mode) {
+  state.layoutMode = mode;
+  localStorage.setItem('cameraFodderLayout', mode);
+  $('gridLayoutButton')?.classList.toggle('active', mode === 'grid');
+  $('focusLayoutButton')?.classList.toggle('active', mode === 'focus');
+  updateVideoLayout();
+}
+
+function setActivePanel(panel) {
+  state.activePanel = panel;
+  const panels = {
+    chat: ['chatPanel', 'tabChat'],
+    people: ['peoplePanel', 'tabPeople'],
+    requests: ['requestPanel', 'tabRequests'],
+    settings: ['settingsPanel', 'tabSettings'],
+  };
+  for (const [name, [panelId, tabId]] of Object.entries(panels)) {
+    $(panelId)?.classList.toggle('active', name === panel);
+    $(tabId)?.classList.toggle('active', name === panel);
+  }
+}
+
+function updateControlStates() {
+  const mic = $('micButton');
+  const camera = $('cameraButton');
+  const screen = $('screenButton');
+  const mirror = $('mirrorSelfToggle');
+  const compact = $('compactTilesToggle');
+  if (mic) {
+    mic.textContent = state.media.audioEnabled ? 'Mic on' : 'Mic off';
+    mic.setAttribute('aria-pressed', String(state.media.audioEnabled));
+    mic.classList.toggle('is-off', !state.media.audioEnabled);
+  }
+  if (camera) {
+    camera.textContent = state.media.videoEnabled ? 'Camera on' : 'Camera off';
+    camera.setAttribute('aria-pressed', String(state.media.videoEnabled));
+    camera.classList.toggle('is-off', !state.media.videoEnabled);
+  }
+  if (screen) {
+    screen.textContent = state.media.screenSharing ? 'Stop sharing' : 'Share screen';
+    screen.setAttribute('aria-pressed', String(state.media.screenSharing));
+    screen.classList.toggle('is-off', state.media.screenSharing);
+  }
+  if (mirror) mirror.checked = state.media.mirrorSelf;
+  if (compact) compact.checked = state.media.compactTiles;
+}
+
+function populateDeviceSelect(selectId, devices, selectedId, fallback) {
+  const select = $(selectId);
+  if (!select) return;
+  const previous = selectedId || select.value;
+  select.innerHTML = '';
+  const defaultOption = document.createElement('option');
+  defaultOption.value = '';
+  defaultOption.textContent = fallback;
+  select.append(defaultOption);
+  devices.forEach((device, index) => {
+    const option = document.createElement('option');
+    option.value = device.deviceId;
+    option.textContent = device.label || `${fallback} ${index + 1}`;
+    select.append(option);
+  });
+  select.value = [...select.options].some((option) => option.value === previous) ? previous : '';
+}
+
+async function refreshDeviceLists() {
+  if (!navigator.mediaDevices?.enumerateDevices) return;
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    populateDeviceSelect('cameraSelect', devices.filter((device) => device.kind === 'videoinput'), state.media.videoDeviceId, 'Default camera');
+    populateDeviceSelect('microphoneSelect', devices.filter((device) => device.kind === 'audioinput'), state.media.audioDeviceId, 'Default microphone');
+    $('settingsStatus').textContent = 'Camera and microphone settings are ready.';
+  } catch (error) {
+    $('settingsStatus').textContent = error.message;
+  }
+}
+
+async function changeDevice(kind, value) {
+  if (kind === 'audio') {
+    state.media.audioDeviceId = value;
+    localStorage.setItem('cameraFodderAudioDevice', value);
+  } else {
+    state.media.videoDeviceId = value;
+    localStorage.setItem('cameraFodderVideoDevice', value);
+  }
+  if (!state.room) return;
+  try {
+    setRoomNotice('Switching device...');
+    await restartCameraStream();
+    setRoomNotice('Device switched.');
+  } catch (error) {
+    setRoomNotice(error.message);
+  }
+}
+
+async function toggleMic() {
+  state.media.audioEnabled = !state.media.audioEnabled;
+  applyMediaPreferences();
+  updateControlStates();
+  broadcastPresence();
+}
+
+async function toggleCamera() {
+  state.media.videoEnabled = !state.media.videoEnabled;
+  applyMediaPreferences();
+  updateControlStates();
+  broadcastPresence();
+}
+
+async function toggleScreenShare() {
+  if (state.media.screenSharing) {
+    stopScreenShare();
+    return;
+  }
+  if (!navigator.mediaDevices?.getDisplayMedia) {
+    setRoomNotice('Screen sharing is not available in this browser.');
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+    state.screenStream = stream;
+    state.media.screenSharing = true;
+    const [track] = stream.getVideoTracks();
+    if (track) {
+      track.onended = () => {
+        if (state.media.screenSharing) stopScreenShare();
+      };
+    }
+    rebuildLocalStream();
+    setRoomNotice('Screen sharing is live.');
+  } catch (error) {
+    setRoomNotice(error.message || 'Screen sharing was cancelled.');
+  }
+}
+
+function stopScreenShare() {
+  const stream = state.screenStream;
+  state.screenStream = null;
+  state.media.screenSharing = false;
+  stream?.getTracks().forEach((track) => {
+    track.onended = null;
+    track.stop();
+  });
+  rebuildLocalStream();
+  setRoomNotice('Screen sharing stopped.');
 }
 
 function peerIsPolite(peerId) {
@@ -250,8 +589,14 @@ async function joinRoom(room, options = {}) {
   requireSession();
   const roomEpoch = ++state.roomEpoch;
   state.room = room;
+  state.mediaByPeer.clear();
+  state.mediaByPeer.set(state.session.id, currentPresence());
+  state.activeVideoId = 'local';
   showRoomView(room.id, options.replaceUrl);
-  $('addRandomButton').disabled = false;
+  setLayoutMode(state.layoutMode);
+  setActivePanel(state.activePanel);
+  updateControlStates();
+  setRoomNotice('Connecting to the room...');
   $('roomTitle').textContent = `Room ${room.id.slice(0, 8)}`;
   renderJoinRequests();
   if (room.participants) {
@@ -276,9 +621,12 @@ async function joinRoom(room, options = {}) {
         await ensureMedia(roomEpoch);
       } catch (error) {
         if (isActiveRoom(room.id, roomEpoch)) console.warn(error);
+        setRoomNotice(error.message);
         return;
       }
       if (!isActiveRoom(room.id, roomEpoch)) return;
+      setRoomNotice('Connected. You can manage media and settings from the control dock.');
+      broadcastPresence();
       for (const peer of event.room.participants.filter((p) => p.session_id !== state.session.id)) {
         if (!isActiveRoom(room.id, roomEpoch)) return;
         await createPeer(peer.session_id, roomEpoch);
@@ -289,17 +637,28 @@ async function joinRoom(room, options = {}) {
       state.participants.set(event.peer.session_id, event.peer);
       renderParticipants();
       await createPeer(event.peer.session_id, roomEpoch);
+      broadcastPresence();
     }
     if (event.type === 'peerLeft') {
       if (!isActiveRoom(room.id, roomEpoch)) return;
       state.peers.get(event.peer_id)?.pc.close();
       state.peers.delete(event.peer_id);
       state.participants.delete(event.peer_id);
+      state.mediaByPeer.delete(event.peer_id);
       renderParticipants();
       removeVideo(event.peer_id);
     }
     if (event.type === 'signal') await handleSignal(event.from, event.payload, roomEpoch);
-    if (event.type === 'chat') appendMessage(`${event.display_name}: ${event.text}`);
+    if (event.type === 'presence') {
+      state.mediaByPeer.set(event.from, {
+        audio_enabled: event.audio_enabled ?? event.audioEnabled,
+        video_enabled: event.video_enabled ?? event.videoEnabled,
+        screen_sharing: event.screen_sharing ?? event.screenSharing,
+      });
+      updateVideoCardState(event.from, state.mediaByPeer.get(event.from));
+      renderParticipants();
+    }
+    if (event.type === 'chat') appendChatMessage(event);
     if (event.type === 'roomUpdated') {
       if (!isActiveRoom(room.id, roomEpoch)) return;
       state.room = event.room;
@@ -312,17 +671,26 @@ async function joinRoom(room, options = {}) {
 }
 
 function renderRoomMeta(room) {
-  $('roomMeta').textContent = `${room.participants.length}/${room.max_size} people · ${room.waiting_for_random ? 'waiting for random match' : 'matched'} · ${room.host_controls_joiners ? 'host controls add-person' : 'anyone can add people'}`;
+  const host = room.participants.find((participant) => participant.session_id === room.host_session);
+  const canAddRandom = !room.host_controls_joiners || room.host_session === state.session?.id;
+  $('roomMeta').textContent = `${room.waiting_for_random ? 'Waiting for a random match' : 'Matched'} · ${room.host_controls_joiners ? 'Host-managed room' : 'Open add-person controls'}`;
+  $('roomStatusPill').textContent = room.waiting_for_random ? 'Waiting' : 'Live';
+  $('roomHostPill').textContent = `Host: ${host?.display_name || 'pending'}`;
+  $('roomCapacityPill').textContent = `${room.participants.length}/${room.max_size}`;
+  $('addRandomButton').disabled = !state.room || !canAddRandom || room.participants.length >= room.max_size;
+  $('addRandomButton').title = canAddRandom ? 'Call another random attendee into this room.' : 'Only the host can call in random attendees.';
 }
 
 function rememberParticipants(room) {
   state.participants.clear();
   for (const participant of room.participants || []) {
     state.participants.set(participant.session_id, participant);
-    const card = document.querySelector(`[data-video-id="${participant.session_id}"]`);
+    const videoId = participant.session_id === state.session?.id ? 'local' : participant.session_id;
+    const card = document.querySelector(`[data-video-id="${videoId}"]`);
     if (card) card.querySelector('.badge').textContent = participant.session_id === state.session?.id
       ? `${participant.display_name} (you)`
       : participant.display_name;
+    updateVideoCardState(videoId, participant.session_id === state.session?.id ? currentPresence() : state.mediaByPeer.get(participant.session_id));
   }
   renderParticipants();
 }
@@ -339,20 +707,57 @@ function renderParticipants() {
   for (const participant of participants) {
     const item = document.createElement('div');
     item.className = 'participant';
+    const main = document.createElement('div');
+    main.className = 'participant-main';
     const name = document.createElement('strong');
     name.textContent = participant.session_id === state.session?.id
       ? `${participant.display_name} (you)`
       : participant.display_name;
     const status = document.createElement('small');
     status.textContent = participant.session_id === state.room?.host_session ? 'Host' : 'Guest';
-    item.append(name, status);
+    main.append(name, status);
+    const badges = document.createElement('div');
+    badges.className = 'participant-badges';
+    const presence = participant.session_id === state.session?.id
+      ? currentPresence()
+      : state.mediaByPeer.get(participant.session_id);
+    badges.append(mediaBadge(presence?.audio_enabled === false ? 'Muted' : 'Mic on', presence?.audio_enabled === false ? 'warning' : 'positive'));
+    badges.append(mediaBadge(presence?.video_enabled === false ? 'Camera off' : 'Video on', presence?.video_enabled === false ? 'warning' : 'positive'));
+    if (presence?.screen_sharing) badges.append(mediaBadge('Sharing', 'positive'));
+    item.append(main, badges);
     list.append(item);
   }
 }
 
+function mediaBadge(text, tone) {
+  const badge = document.createElement('span');
+  badge.className = `mini-badge ${tone}`;
+  badge.textContent = text;
+  return badge;
+}
+
 function appendMessage(text) {
   const line = document.createElement('div');
+  line.className = 'message-row';
   line.textContent = text;
+  $('messages').append(line);
+  $('messages').scrollTop = $('messages').scrollHeight;
+}
+
+function appendChatMessage(event) {
+  const line = document.createElement('div');
+  line.className = 'message-row';
+  const meta = document.createElement('div');
+  meta.className = 'message-meta';
+  const sender = document.createElement('strong');
+  sender.textContent = event.from === state.session?.id ? 'You' : (event.display_name || event.displayName || 'Guest');
+  const time = document.createElement('span');
+  time.textContent = new Date(event.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const text = document.createElement('div');
+  text.className = 'message-text';
+  text.textContent = event.text;
+  meta.append(sender, time);
+  line.append(meta, text);
   $('messages').append(line);
   $('messages').scrollTop = $('messages').scrollHeight;
 }
@@ -633,9 +1038,11 @@ async function leaveCurrentRoom(updateListing = true, navigateHome = true) {
   state.peers.forEach(({ pc }) => pc.close());
   state.peers.clear();
   state.participants.clear();
+  state.mediaByPeer.clear();
   stopLocalMedia();
   state.room = null;
   $('videos').innerHTML = '';
+  updateVideoLayout();
   renderParticipants();
   showLobbyView();
   if (navigateHome && location.pathname !== '/') history.pushState({}, '', '/');
@@ -694,6 +1101,7 @@ $('inviteJoinButton').onclick = async () => {
 $('startRoomButton').onclick = async () => {
   try {
     requireSession();
+    setLaunchStatus('Finding a room...');
     const { room } = await api('/api/rooms/random', {
       session_id: state.session.id,
       size: Number($('roomSize').value || 2),
@@ -703,19 +1111,59 @@ $('startRoomButton').onclick = async () => {
     await joinRoom(room);
     await updateDirectory();
     await refreshJoinRequests();
-  } catch (error) { alert(error.message); }
+    setLaunchStatus('Room connected.');
+  } catch (error) {
+    setLaunchStatus(error.message);
+  }
 };
 $('addRandomButton').onclick = async () => {
   try {
+    setRoomNotice('Calling in another random attendee...');
     const { room } = await api(`/api/rooms/${state.room.id}/add-random`, { session_id: state.session.id, room_id: state.room.id });
     state.room = room;
     renderRoomMeta(room);
-  } catch (error) { alert(error.message); }
+    setRoomNotice('The room is open for another random attendee.');
+  } catch (error) {
+    setRoomNotice(error.message);
+  }
 };
-$('copyLinkButton').onclick = async () => navigator.clipboard.writeText(`${location.origin}${roomPath(state.room.id)}`);
+$('copyLinkButton').onclick = async () => {
+  if (!state.room) return;
+  const link = `${location.origin}${roomPath(state.room.id)}`;
+  try {
+    await navigator.clipboard.writeText(link);
+    setRoomNotice('Room link copied.');
+  } catch {
+    setRoomNotice(`Copy failed. Room link: ${link}`);
+  }
+};
 $('leaveButton').onclick = async () => {
   await leaveCurrentRoom();
   await refreshJoinRequests();
+};
+$('micButton').onclick = toggleMic;
+$('cameraButton').onclick = toggleCamera;
+$('screenButton').onclick = toggleScreenShare;
+$('gridLayoutButton').onclick = () => setLayoutMode('grid');
+$('focusLayoutButton').onclick = () => setLayoutMode('focus');
+$('tabChat').onclick = () => setActivePanel('chat');
+$('tabPeople').onclick = () => setActivePanel('people');
+$('tabRequests').onclick = () => setActivePanel('requests');
+$('tabSettings').onclick = () => setActivePanel('settings');
+$('chatToggleButton').onclick = () => setActivePanel('chat');
+$('peopleToggleButton').onclick = () => setActivePanel('people');
+$('settingsToggleButton').onclick = () => setActivePanel('settings');
+$('cameraSelect').onchange = (event) => changeDevice('video', event.target.value);
+$('microphoneSelect').onchange = (event) => changeDevice('audio', event.target.value);
+$('mirrorSelfToggle').onchange = (event) => {
+  state.media.mirrorSelf = event.target.checked;
+  localStorage.setItem('cameraFodderMirrorSelf', String(state.media.mirrorSelf));
+  updateVideoCardState('local', currentPresence());
+};
+$('compactTilesToggle').onchange = (event) => {
+  state.media.compactTiles = event.target.checked;
+  localStorage.setItem('cameraFodderCompactTiles', String(state.media.compactTiles));
+  updateVideoLayout();
 };
 $('chatForm').onsubmit = (event) => {
   event.preventDefault();
@@ -746,9 +1194,13 @@ window.addEventListener('popstate', () => {
 if (state.pendingRoomId) showInviteView(state.pendingRoomId, true);
 else showLobbyView();
 setRequestStatus();
+setLayoutMode(state.layoutMode);
+setActivePanel(state.activePanel);
+updateControlStates();
 renderJoinRequests();
 if (state.session) validateStoredSession().catch(console.warn);
 refreshDirectory().catch(console.warn);
+refreshDeviceLists().catch(console.warn);
 setInterval(() => {
   refreshDirectory().catch(console.warn);
   refreshJoinRequests().catch(console.warn);

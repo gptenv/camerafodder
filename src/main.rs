@@ -180,6 +180,14 @@ enum ClientWsEvent {
         to: Uuid,
         payload: serde_json::Value,
     },
+    Presence {
+        #[serde(alias = "audioEnabled")]
+        audio_enabled: bool,
+        #[serde(alias = "videoEnabled")]
+        video_enabled: bool,
+        #[serde(alias = "screenSharing")]
+        screen_sharing: bool,
+    },
     Chat {
         text: String,
     },
@@ -202,6 +210,12 @@ enum ServerWsEvent {
     Signal {
         from: Uuid,
         payload: serde_json::Value,
+    },
+    Presence {
+        from: Uuid,
+        audio_enabled: bool,
+        video_enabled: bool,
+        screen_sharing: bool,
     },
     Chat {
         from: Uuid,
@@ -783,6 +797,24 @@ async fn handle_socket(state: SharedState, room_id: Uuid, session_id: Uuid, sock
                     },
                 );
             }
+            Ok(ClientWsEvent::Presence {
+                audio_enabled,
+                video_enabled,
+                screen_sharing,
+            }) => {
+                let locked = state.lock().await;
+                broadcast_except(
+                    &locked,
+                    room_id,
+                    session_id,
+                    ServerWsEvent::Presence {
+                        from: session_id,
+                        audio_enabled,
+                        video_enabled,
+                        screen_sharing,
+                    },
+                );
+            }
             Ok(ClientWsEvent::Chat { text }) => {
                 let clipped: String = text.chars().take(500).collect();
                 let locked = state.lock().await;
@@ -1305,6 +1337,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(lookup_response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn presence_events_accept_browser_field_names() {
+        let event: ClientWsEvent = serde_json::from_value(serde_json::json!({
+            "type": "presence",
+            "audioEnabled": false,
+            "videoEnabled": true,
+            "screenSharing": true
+        }))
+        .unwrap();
+
+        match event {
+            ClientWsEvent::Presence {
+                audio_enabled,
+                video_enabled,
+                screen_sharing,
+            } => {
+                assert!(!audio_enabled);
+                assert!(video_enabled);
+                assert!(screen_sharing);
+            }
+            _ => panic!("expected presence event"),
+        }
     }
 
     #[tokio::test]

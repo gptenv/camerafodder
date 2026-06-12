@@ -1,6 +1,6 @@
 # Camera Fodder
 
-Camera Fodder is a first-version Rust + modern JavaScript random video chat application inspired by the classic anonymous pairing flow, updated for small WebRTC rooms.
+Camera Fodder is a Rust + modern JavaScript random video chat application inspired by the classic anonymous pairing flow, updated for polished small-group WebRTC rooms.
 
 ## Features in this version
 
@@ -9,7 +9,9 @@ Camera Fodder is a first-version Rust + modern JavaScript random video chat appl
 - OAuth provider buttons are represented in the UI as placeholders for future Google, Facebook, and additional provider integrations.
 - Random matching into rooms of up to 8 participants, defaulting to 2.
 - Dedicated `/room/:room_id` links first show a request-to-join page where visitors can start a guest/local session, choose a display name, and ask to enter before joining the video room.
-- Accepted users enter a video-first conference layout with chat, attendee list, call controls, and join-request tools.
+- Accepted users enter a video-first conference layout with adaptive tiles, chat, attendee list, call controls, and join-request tools.
+- Meeting controls include mic/camera toggles, screen sharing, grid/focus layouts, mirrored self-view, compact tile mode, and camera/microphone device selectors.
+- Participants publish lightweight presence state so attendees can see who is muted, who has video off, and who is sharing a screen.
 - Any participant can call in another random person unless the room was started with host-controlled add-person permissions.
 - Host-control rooms are intentionally excluded from matching with other host-control rooms.
 - Optional room share links.

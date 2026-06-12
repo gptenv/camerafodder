@@ -7,67 +7,82 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <main id="lobbyView" class="shell">
-      <section class="hero panel">
-        <div>
-          <p class="eyebrow">Modern random video rooms</p>
+    <main id="lobbyView" class="app-shell">
+      <section class="hero-panel">
+        <div class="hero-copy">
+          <p class="eyebrow">Secure random video rooms</p>
           <h1>Camera Fodder</h1>
-          <p class="lede">Drop into anonymous or signed-in WebRTC video chats, invite random people on demand, and opt into a live global directory while you are online.</p>
+          <p class="lede">Fast video rooms with guest access, local accounts, request-based entry, host controls, and a live directory for finding people who are ready to talk.</p>
+          <div class="hero-actions">
+            <a href="#start" class="button-link">Start a session</a>
+            <a href="#directorySection" class="button-link secondary">Open directory</a>
+          </div>
         </div>
-        <div class="status-card">
-          <span id="connectionDot" class="dot"></span>
-          <strong id="sessionName">Not signed in</strong>
-          <small id="sessionId">Use guest mode or local auth to begin.</small>
+
+        <aside class="session-card">
+          <div class="status-row">
+            <span id="connectionDot" class="dot"></span>
+            <span class="status-copy">
+              <strong id="sessionName">Not signed in</strong>
+              <small id="sessionId">Use guest mode or local auth to begin.</small>
+            </span>
+          </div>
           <button type="button" id="logoutButton" class="secondary hidden">Sign out</button>
-        </div>
+        </aside>
       </section>
 
-      <section class="grid">
-        <form id="authForm" class="panel stack">
-          <h2>Start your session</h2>
-          <label>Display name <input id="displayName" maxlength="32" placeholder="Guest name" /></label>
+      <section id="start" class="workspace-grid">
+        <form id="authForm" class="surface stack">
+          <div>
+            <p class="eyebrow">Identity</p>
+            <h2>Start your session</h2>
+          </div>
+          <label>Display name <input id="displayName" maxlength="32" placeholder="Guest name" autocomplete="name" /></label>
           <div class="row">
             <button type="button" id="guestButton">Continue as guest</button>
-            <button type="button" id="signupButton">Create local account</button>
+            <button type="button" id="signupButton" class="secondary">Create account</button>
           </div>
-          <label>Email <input id="email" type="email" placeholder="you@example.com" /></label>
-          <label>Password <input id="password" type="password" placeholder="8+ characters" /></label>
-          <button type="button" id="signinButton">Sign in locally</button>
+          <label>Email <input id="email" type="email" placeholder="you@example.com" autocomplete="email" /></label>
+          <label>Password <input id="password" type="password" placeholder="8+ characters" autocomplete="current-password" /></label>
+          <button type="button" id="signinButton" class="secondary">Sign in locally</button>
           <p id="authStatus" class="hint">Use guest mode, or create/sign into a local account.</p>
           <div class="oauth-row" aria-label="OAuth placeholders">
             <button type="button" disabled>Google soon</button>
             <button type="button" disabled>Facebook soon</button>
-            <button type="button" disabled>More providers soon</button>
+            <button type="button" disabled>SSO soon</button>
           </div>
         </form>
 
-        <section class="panel stack">
-          <h2>Random room</h2>
+        <section class="surface stack">
+          <div>
+            <p class="eyebrow">Meeting</p>
+            <h2>Random room</h2>
+          </div>
           <label>Preferred room size <input id="roomSize" type="number" min="2" max="8" value="2" /></label>
-          <label class="check"><input id="shareLinks" type="checkbox" /> Enable optional room share link</label>
-          <label class="check"><input id="hostControls" type="checkbox" /> Host controls who can call in new random joiners</label>
-          <button id="startRoomButton">Start / find random chat</button>
-          <p class="hint">Rooms support up to 8 people. Host-control rooms will not be randomly paired with other host-control rooms.</p>
+          <div class="option-list">
+            <label class="check"><input id="shareLinks" type="checkbox" /> Enable room share link requests</label>
+            <label class="check"><input id="hostControls" type="checkbox" /> Let only the host call in random joiners</label>
+          </div>
+          <button id="startRoomButton">Start or find a room</button>
+          <p id="roomLaunchStatus" class="hint">Rooms support up to 8 people. Host-control rooms are matched carefully to avoid control conflicts.</p>
         </section>
       </section>
 
-      <section class="grid request-grid">
-        <section class="panel stack">
-          <div class="directory-head">
-            <div>
-              <p class="eyebrow">Global Directory</p>
-              <h2>Online phone book for video chats</h2>
-            </div>
-            <label class="check"><input id="directoryOptIn" type="checkbox" /> List me while online</label>
+      <section id="directorySection" class="surface directory-panel">
+        <div class="directory-head">
+          <div>
+            <p class="eyebrow">Global directory</p>
+            <h2>Live room directory</h2>
           </div>
-          <p id="directoryStatus" class="hint">Requests are checked quietly in the background.</p>
-          <div id="directory" class="directory"></div>
-        </section>
+          <label class="check switch-row"><input id="directoryOptIn" type="checkbox" /> List me while online</label>
+        </div>
+        <p id="directoryStatus" class="hint">Start a session to send and accept requests.</p>
+        <div id="directory" class="directory"></div>
       </section>
     </main>
 
     <main id="inviteView" class="invite-shell hidden">
-      <section class="invite-card panel">
+      <section class="invite-card surface">
         <div>
           <p class="eyebrow">Room invite</p>
           <h1 id="inviteRoomTitle">Request to join</h1>
@@ -75,29 +90,39 @@
         </div>
 
         <section class="invite-grid">
-          <form id="inviteAuthForm" class="stack">
-            <h2>Join as yourself</h2>
-            <label>Display name <input id="inviteDisplayName" maxlength="32" placeholder="Your room name" /></label>
+          <form id="inviteAuthForm" class="surface nested stack">
+            <div>
+              <p class="eyebrow">Identity</p>
+              <h2>Join as yourself</h2>
+            </div>
+            <label>Display name <input id="inviteDisplayName" maxlength="32" placeholder="Your room name" autocomplete="name" /></label>
             <div class="row">
               <button type="button" id="inviteGuestButton">Continue as guest</button>
-              <button type="button" id="inviteSignupButton">Create local account</button>
+              <button type="button" id="inviteSignupButton" class="secondary">Create account</button>
             </div>
-            <label>Email <input id="inviteEmail" type="email" placeholder="you@example.com" /></label>
-            <label>Password <input id="invitePassword" type="password" placeholder="8+ characters" /></label>
+            <label>Email <input id="inviteEmail" type="email" placeholder="you@example.com" autocomplete="email" /></label>
+            <label>Password <input id="invitePassword" type="password" placeholder="8+ characters" autocomplete="current-password" /></label>
             <button type="button" id="inviteSigninButton" class="secondary">Sign in locally</button>
           </form>
 
-          <section class="invite-request stack">
-            <h2>Ask to enter</h2>
-            <div class="status-card">
-              <span id="inviteConnectionDot" class="dot"></span>
-              <strong id="inviteSessionName">Not signed in</strong>
-              <small id="inviteSessionId">Start a guest or local account session first.</small>
+          <section class="invite-request surface nested stack">
+            <div>
+              <p class="eyebrow">Access</p>
+              <h2>Ask to enter</h2>
+            </div>
+            <div class="session-card compact">
+              <div class="status-row">
+                <span id="inviteConnectionDot" class="dot"></span>
+                <span class="status-copy">
+                  <strong id="inviteSessionName">Not signed in</strong>
+                  <small id="inviteSessionId">Start a guest or local account session first.</small>
+                </span>
+              </div>
               <button type="button" id="inviteLogoutButton" class="secondary hidden">Sign out</button>
             </div>
             <button id="inviteRequestButton" disabled>Request to join</button>
             <button id="inviteJoinButton" class="hidden">Join room</button>
-            <p class="hint">Requests appear quietly inside the room. Someone already inside can accept you from their join-request panel.</p>
+            <p class="hint">Requests appear quietly inside the room. Someone already inside can accept you from the request panel.</p>
           </section>
         </section>
       </section>
@@ -105,45 +130,66 @@
 
     <section id="roomPanel" class="room-page hidden">
       <header class="room-topbar">
-        <div>
+        <div class="room-title-block">
           <p class="eyebrow">Live room</p>
           <h1 id="roomTitle">No active room</h1>
           <p id="roomMeta"></p>
         </div>
-        <div class="call-controls">
-          <button id="addRandomButton" disabled>Call in random</button>
+        <div class="room-pills" aria-label="Room status">
+          <span id="roomStatusPill" class="room-pill">Connecting</span>
+          <span id="roomHostPill" class="room-pill">Host pending</span>
+          <span id="roomCapacityPill" class="room-pill">0/8</span>
+        </div>
+        <div class="top-actions">
           <button id="copyLinkButton" class="secondary">Copy link</button>
-          <button id="leaveButton" class="danger">Leave</button>
+          <button id="addRandomButton" class="secondary" disabled>Call in random</button>
         </div>
       </header>
 
       <main class="conference-layout">
         <section class="video-stage" aria-label="Video call">
-          <div id="videos" class="videos"></div>
+          <div class="stage-header">
+            <p id="roomNotice" class="meeting-notice">Preparing the room...</p>
+            <div class="layout-segment" aria-label="Video layout">
+              <button type="button" id="gridLayoutButton" class="active">Grid</button>
+              <button type="button" id="focusLayoutButton">Focus</button>
+            </div>
+          </div>
+          <div id="videos" class="videos grid-layout" data-count="0"></div>
         </section>
 
-        <aside class="room-sidebar" aria-label="Room tools">
-          <section class="sidebar-card chat-card">
-            <div>
+        <aside id="roomSidebar" class="room-sidebar" aria-label="Room tools">
+          <nav class="sidebar-tabs" aria-label="Room panel tabs">
+            <button type="button" id="tabChat" class="active">Chat</button>
+            <button type="button" id="tabPeople">People</button>
+            <button type="button" id="tabRequests">Requests</button>
+            <button type="button" id="tabSettings">Settings</button>
+          </nav>
+
+          <section id="chatPanel" class="sidebar-panel active">
+            <div class="panel-head">
               <p class="eyebrow">Chat</p>
               <h2>Room chat</h2>
             </div>
-            <div id="messages" class="messages"></div>
-            <form id="chatForm" class="chat-form"><input id="chatInput" placeholder="Say something kind…" /><button>Send</button></form>
+            <div id="messages" class="messages" aria-live="polite"></div>
+            <form id="chatForm" class="chat-form">
+              <input id="chatInput" placeholder="Message everyone" autocomplete="off" />
+              <button>Send</button>
+            </form>
           </section>
 
-          <section class="sidebar-card">
-            <div>
+          <section id="peoplePanel" class="sidebar-panel">
+            <div class="panel-head">
               <p class="eyebrow">People</p>
               <h2>Attendees</h2>
             </div>
             <div id="participants" class="participant-list"></div>
           </section>
 
-          <section id="requestPanel" class="sidebar-card">
-            <div>
-              <p class="eyebrow">Join Requests</p>
-              <h2>Room requests</h2>
+          <section id="requestPanel" class="sidebar-panel">
+            <div class="panel-head">
+              <p class="eyebrow">Access</p>
+              <h2>Join requests</h2>
             </div>
             <p id="requestStatus" class="hint">Start a session to send and accept requests.</p>
             <div class="request-section">
@@ -155,8 +201,32 @@
               <div id="outgoingRequests" class="request-list"></div>
             </div>
           </section>
+
+          <section id="settingsPanel" class="sidebar-panel">
+            <div class="panel-head">
+              <p class="eyebrow">Controls</p>
+              <h2>Meeting settings</h2>
+            </div>
+            <div class="settings-list">
+              <label>Camera <select id="cameraSelect"></select></label>
+              <label>Microphone <select id="microphoneSelect"></select></label>
+              <label class="check switch-row"><input id="mirrorSelfToggle" type="checkbox" checked /> Mirror my self view</label>
+              <label class="check switch-row"><input id="compactTilesToggle" type="checkbox" /> Compact video tiles</label>
+            </div>
+            <p id="settingsStatus" class="hint">Device options appear after camera and microphone permission is granted.</p>
+          </section>
         </aside>
       </main>
+
+      <footer class="control-dock" aria-label="Call controls">
+        <button id="micButton" type="button" class="control-button" aria-pressed="true">Mic on</button>
+        <button id="cameraButton" type="button" class="control-button" aria-pressed="true">Camera on</button>
+        <button id="screenButton" type="button" class="control-button secondary" aria-pressed="false">Share screen</button>
+        <button id="chatToggleButton" type="button" class="control-button secondary">Chat</button>
+        <button id="peopleToggleButton" type="button" class="control-button secondary">People</button>
+        <button id="settingsToggleButton" type="button" class="control-button secondary">Settings</button>
+        <button id="leaveButton" type="button" class="control-button danger">Leave</button>
+      </footer>
     </section>
     <script type="module" src="/app.js"></script>
   </body>
