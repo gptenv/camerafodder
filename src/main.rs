@@ -22,12 +22,19 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
-use tokio::sync::{mpsc, Mutex};
+use tokio::{
+    sync::{mpsc, Mutex},
+    time,
+};
 use tower_http::{services::ServeDir, trace::TraceLayer};
 use uuid::Uuid;
 
 const MAX_ROOM_SIZE: usize = 8;
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const PRESENCE_TIMEOUT_SECONDS: i64 = 45;
+const PENDING_ROOM_JOIN_TIMEOUT_SECONDS: i64 = 30;
 
 type SharedState = Arc<Mutex<AppState>>;
 
@@ -49,6 +56,9 @@ struct AppState {
     rooms: HashMap<Uuid, Room>,
     directory: HashMap<Uuid, DirectoryEntry>,
     join_requests: HashMap<Uuid, JoinRequest>,
+    direct_chat_requests: HashMap<Uuid, DirectChatRequest>,
+    presence_connections: HashMap<Uuid, PresenceConnection>,
+    stats_subscribers: HashMap<Uuid, mpsc::UnboundedSender<StatsSnapshot>>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -88,10 +98,25 @@ struct Room {
     host_controls_joiners: bool,
     share_link_enabled: bool,
     participants: HashSet<Uuid>,
+    participant_joined_at: HashMap<Uuid, DateTime<Utc>>,
     approved_joiners: HashSet<Uuid>,
     senders: HashMap<Uuid, mpsc::UnboundedSender<ServerWsEvent>>,
+    connection_ids: HashMap<Uuid, Uuid>,
     waiting_for_random: bool,
     created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Copy)]
+struct PresenceConnection {
+    session_id: Uuid,
+    kind: PresenceConnectionKind,
+    last_seen: DateTime<Utc>,
+}
+
+#[derive(Clone, Copy)]
+enum PresenceConnectionKind {
+    Stats,
+    Room { room_id: Uuid },
 }
 
 #[derive(Clone, Serialize)]
@@ -101,6 +126,20 @@ struct JoinRequest {
     requester_session: Uuid,
     requester_display_name: String,
     status: JoinRequestStatus,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    accepted_by: Option<Uuid>,
+}
+
+#[derive(Clone, Serialize)]
+struct DirectChatRequest {
+    id: Uuid,
+    requester_session: Uuid,
+    requester_display_name: String,
+    target_session: Uuid,
+    target_display_name: String,
+    status: JoinRequestStatus,
+    room_id: Option<Uuid>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     accepted_by: Option<Uuid>,
@@ -164,6 +203,12 @@ struct JoinRoomRequest {
 }
 
 #[derive(Deserialize)]
+struct CreateDirectChatRequest {
+    session_id: Uuid,
+    target_session_id: Uuid,
+}
+
+#[derive(Deserialize)]
 struct JoinRequestsQuery {
     session_id: Uuid,
 }
@@ -191,6 +236,7 @@ enum ClientWsEvent {
     Chat {
         text: String,
     },
+    Heartbeat,
     Leave,
 }
 
@@ -225,6 +271,11 @@ enum ServerWsEvent {
     },
     RoomUpdated {
         room: RoomSnapshot,
+    },
+    JoinRequestsChanged {
+        pending_count: usize,
+        requester_display_name: Option<String>,
+        accepted: bool,
     },
     Error {
         message: String,
@@ -274,11 +325,18 @@ struct DirectoryResponse {
 struct JoinRequestsResponse {
     incoming: Vec<JoinRequestSummary>,
     outgoing: Vec<JoinRequestSummary>,
+    direct_incoming: Vec<DirectChatRequestSummary>,
+    direct_outgoing: Vec<DirectChatRequestSummary>,
 }
 
 #[derive(Serialize)]
 struct JoinRequestResponse {
     request: JoinRequestSummary,
+}
+
+#[derive(Serialize)]
+struct DirectChatRequestResponse {
+    request: DirectChatRequestSummary,
 }
 
 #[derive(Clone, Serialize)]
@@ -295,10 +353,36 @@ struct JoinRequestSummary {
     room_is_full: bool,
 }
 
+#[derive(Clone, Serialize)]
+struct DirectChatRequestSummary {
+    id: Uuid,
+    requester_session: Uuid,
+    requester_display_name: String,
+    target_session: Uuid,
+    target_display_name: String,
+    status: JoinRequestStatus,
+    room_id: Option<Uuid>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    accepted_by: Option<Uuid>,
+    can_accept: bool,
+}
+
 #[derive(Serialize)]
 struct HealthResponse {
     ok: bool,
     service: &'static str,
+}
+
+#[derive(Clone, Serialize)]
+struct StatsSnapshot {
+    online_count: usize,
+    in_call_count: usize,
+}
+
+#[derive(Deserialize)]
+struct StatsWsParams {
+    session_id: Option<Uuid>,
 }
 
 #[tokio::main]
@@ -335,6 +419,7 @@ fn build_router() -> Router {
 }
 
 fn build_router_with_app(app: App) -> Router {
+    spawn_presence_sweeper(app.state.clone());
     Router::new()
         .route("/api/health", get(health))
         .route("/api/auth/guest", post(guest))
@@ -350,7 +435,13 @@ fn build_router_with_app(app: App) -> Router {
             "/api/join-requests/:request_id/accept",
             post(accept_join_request),
         )
+        .route("/api/direct-requests", post(create_direct_chat_request))
+        .route(
+            "/api/direct-requests/:request_id/accept",
+            post(accept_direct_chat_request),
+        )
         .route("/api/directory", get(list_directory).post(upsert_directory))
+        .route("/ws/stats", get(stats_ws))
         .route("/ws/rooms/:room_id", get(room_ws))
         .route("/room/:room_id", get(index_html))
         .nest_service(
@@ -359,6 +450,17 @@ fn build_router_with_app(app: App) -> Router {
         )
         .layer(TraceLayer::new_for_http())
         .with_state(app)
+}
+
+fn spawn_presence_sweeper(state: SharedState) {
+    tokio::spawn(async move {
+        let mut interval = time::interval(HEARTBEAT_INTERVAL);
+        loop {
+            interval.tick().await;
+            let mut locked = state.lock().await;
+            broadcast_stats(&mut locked);
+        }
+    });
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -377,6 +479,10 @@ async fn guest(
     Json(payload): Json<GuestRequest>,
 ) -> Result<Json<AuthResponse>, ApiError> {
     let display_name = clean_name(payload.display_name.unwrap_or_else(|| "Guest".into()));
+    {
+        let state = app.state.lock().await;
+        ensure_guest_display_name_available(&state, &display_name)?;
+    }
     let session = create_session(&app, display_name, None).await?;
     Ok(Json(AuthResponse { session }))
 }
@@ -449,7 +555,9 @@ async fn signout(
     let mut state = app.state.lock().await;
     state.sessions.remove(&payload.session_id);
     state.directory.remove(&payload.session_id);
+    release_session_presence(&mut state, payload.session_id);
     app.auth_store.save(&state)?;
+    broadcast_stats(&mut state);
     Ok(Json(OkResponse { ok: true }))
 }
 
@@ -472,16 +580,19 @@ async fn start_random_room(
     }
 
     let room_id = Uuid::new_v4();
+    let now = Utc::now();
     let room = Room {
         id: room_id,
         host_session: payload.session_id,
         host_controls_joiners: host_controls,
         share_link_enabled,
         participants: HashSet::from([payload.session_id]),
+        participant_joined_at: HashMap::from([(payload.session_id, now)]),
         approved_joiners: HashSet::new(),
         senders: HashMap::new(),
+        connection_ids: HashMap::new(),
         waiting_for_random: requested_size > 1,
-        created_at: Utc::now(),
+        created_at: now,
     };
     state.rooms.insert(room_id, room);
     let snapshot = room_snapshot(&state, room_id)?;
@@ -579,9 +690,14 @@ async fn create_join_request(
     let request_id = request.id;
     state.join_requests.insert(request_id, request);
     let request = state.join_requests.get(&request_id).unwrap();
-    Ok(Json(JoinRequestResponse {
-        request: join_request_summary(&state, request, payload.session_id),
-    }))
+    let summary = join_request_summary(&state, request, payload.session_id);
+    broadcast_join_requests_changed(
+        &state,
+        room_id,
+        Some(summary.requester_display_name.clone()),
+        false,
+    );
+    Ok(Json(JoinRequestResponse { request: summary }))
 }
 
 async fn list_join_requests(
@@ -613,7 +729,29 @@ async fn list_join_requests(
         .collect();
     outgoing.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
 
-    Ok(Json(JoinRequestsResponse { incoming, outgoing }))
+    let mut direct_incoming: Vec<_> = state
+        .direct_chat_requests
+        .values()
+        .filter(|request| request.status == JoinRequestStatus::Pending)
+        .filter(|request| request.target_session == query.session_id)
+        .map(|request| direct_chat_request_summary(request, query.session_id))
+        .collect();
+    direct_incoming.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+
+    let mut direct_outgoing: Vec<_> = state
+        .direct_chat_requests
+        .values()
+        .filter(|request| request.requester_session == query.session_id)
+        .map(|request| direct_chat_request_summary(request, query.session_id))
+        .collect();
+    direct_outgoing.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+
+    Ok(Json(JoinRequestsResponse {
+        incoming,
+        outgoing,
+        direct_incoming,
+        direct_outgoing,
+    }))
 }
 
 async fn accept_join_request(
@@ -659,21 +797,157 @@ async fn accept_join_request(
     }
 
     let request = state.join_requests.get(&request_id).unwrap();
-    Ok(Json(JoinRequestResponse {
-        request: join_request_summary(&state, request, payload.session_id),
+    let summary = join_request_summary(&state, request, payload.session_id);
+    broadcast_join_requests_changed(
+        &state,
+        request.room_id,
+        Some(summary.requester_display_name.clone()),
+        true,
+    );
+    Ok(Json(JoinRequestResponse { request: summary }))
+}
+
+async fn create_direct_chat_request(
+    State(app): State<App>,
+    Json(payload): Json<CreateDirectChatRequest>,
+) -> Result<Json<DirectChatRequestResponse>, ApiError> {
+    let mut state = app.state.lock().await;
+    ensure_session(&state, payload.session_id)?;
+    if payload.session_id == payload.target_session_id {
+        return Err(ApiError::bad_request(
+            "You cannot request a chat with yourself.",
+        ));
+    }
+    state
+        .sessions
+        .get(&payload.target_session_id)
+        .ok_or_else(|| ApiError::not_found("That person is no longer online."))?;
+    if live_room_for_session(&state, payload.target_session_id).is_some() {
+        return Err(ApiError::conflict(
+            "That person is already in a room. Request to join their room instead.",
+        ));
+    }
+    if !state
+        .directory
+        .get(&payload.target_session_id)
+        .is_some_and(|entry| entry.available)
+    {
+        return Err(ApiError::conflict(
+            "That person is not listed as available right now.",
+        ));
+    }
+    if !is_session_online(&state, payload.target_session_id) {
+        return Err(ApiError::conflict("That person is no longer online."));
+    }
+
+    if let Some(existing) = state.direct_chat_requests.values().find(|request| {
+        request.requester_session == payload.session_id
+            && request.target_session == payload.target_session_id
+            && request.status == JoinRequestStatus::Pending
+    }) {
+        return Ok(Json(DirectChatRequestResponse {
+            request: direct_chat_request_summary(existing, payload.session_id),
+        }));
+    }
+
+    let requester_display_name = state
+        .sessions
+        .get(&payload.session_id)
+        .map(|session| session.display_name.clone())
+        .unwrap_or_else(|| "Guest".into());
+    let target_display_name = state
+        .sessions
+        .get(&payload.target_session_id)
+        .map(|session| session.display_name.clone())
+        .unwrap_or_else(|| "Guest".into());
+    let now = Utc::now();
+    let request = DirectChatRequest {
+        id: Uuid::new_v4(),
+        requester_session: payload.session_id,
+        requester_display_name,
+        target_session: payload.target_session_id,
+        target_display_name,
+        status: JoinRequestStatus::Pending,
+        room_id: None,
+        created_at: now,
+        updated_at: now,
+        accepted_by: None,
+    };
+    let request_id = request.id;
+    state.direct_chat_requests.insert(request_id, request);
+    let request = state.direct_chat_requests.get(&request_id).unwrap();
+    Ok(Json(DirectChatRequestResponse {
+        request: direct_chat_request_summary(request, payload.session_id),
+    }))
+}
+
+async fn accept_direct_chat_request(
+    State(app): State<App>,
+    Path(request_id): Path<Uuid>,
+    Json(payload): Json<JoinRoomRequest>,
+) -> Result<Json<DirectChatRequestResponse>, ApiError> {
+    let mut state = app.state.lock().await;
+    ensure_session(&state, payload.session_id)?;
+
+    let request = state
+        .direct_chat_requests
+        .get(&request_id)
+        .ok_or_else(|| ApiError::not_found("Chat request not found."))?
+        .clone();
+    if request.target_session != payload.session_id {
+        return Err(ApiError::forbidden(
+            "Only the requested person can accept this chat invite.",
+        ));
+    }
+    if request.status != JoinRequestStatus::Pending {
+        return Err(ApiError::conflict(
+            "That chat request is no longer pending.",
+        ));
+    }
+    if live_room_for_session(&state, request.requester_session).is_some()
+        || live_room_for_session(&state, request.target_session).is_some()
+    {
+        return Err(ApiError::conflict(
+            "One of you is already in a room. Try again once you are both available.",
+        ));
+    }
+
+    let room_id = Uuid::new_v4();
+    let now = Utc::now();
+    let room = Room {
+        id: room_id,
+        host_session: request.target_session,
+        host_controls_joiners: false,
+        share_link_enabled: true,
+        participants: HashSet::new(),
+        participant_joined_at: HashMap::new(),
+        approved_joiners: HashSet::from([request.requester_session]),
+        senders: HashMap::new(),
+        connection_ids: HashMap::new(),
+        waiting_for_random: false,
+        created_at: now,
+    };
+    state.rooms.insert(room_id, room);
+    {
+        let request = state.direct_chat_requests.get_mut(&request_id).unwrap();
+        request.status = JoinRequestStatus::Accepted;
+        request.updated_at = Utc::now();
+        request.accepted_by = Some(payload.session_id);
+        request.room_id = Some(room_id);
+    }
+
+    let request = state.direct_chat_requests.get(&request_id).unwrap();
+    Ok(Json(DirectChatRequestResponse {
+        request: direct_chat_request_summary(request, payload.session_id),
     }))
 }
 
 async fn list_directory(State(app): State<App>) -> Json<DirectoryResponse> {
-    let state = app.state.lock().await;
-    let mut entries: Vec<_> = state
-        .directory
-        .values()
-        .filter(|e| e.available)
-        .cloned()
-        .collect();
-    entries.sort_by(|a, b| a.display_name.cmp(&b.display_name));
-    Json(DirectoryResponse { entries })
+    let mut state = app.state.lock().await;
+    prune_stale_directory(&mut state);
+    Json(DirectoryResponse {
+        entries: directory_entries(&state),
+    })
 }
 
 async fn upsert_directory(
@@ -682,13 +956,17 @@ async fn upsert_directory(
 ) -> Result<Json<DirectoryResponse>, ApiError> {
     let mut state = app.state.lock().await;
     ensure_session(&state, payload.session_id)?;
+    prune_stale_directory(&mut state);
     if payload.available {
+        let room_id = payload
+            .room_id
+            .or_else(|| live_room_for_session(&state, payload.session_id));
         state.directory.insert(
             payload.session_id,
             DirectoryEntry {
                 session_id: payload.session_id,
                 display_name: clean_name(payload.display_name),
-                room_id: payload.room_id,
+                room_id,
                 available: true,
                 updated_at: Utc::now(),
             },
@@ -696,14 +974,83 @@ async fn upsert_directory(
     } else {
         state.directory.remove(&payload.session_id);
     }
-    let mut entries: Vec<_> = state
-        .directory
-        .values()
-        .filter(|e| e.available)
-        .cloned()
-        .collect();
-    entries.sort_by(|a, b| a.display_name.cmp(&b.display_name));
-    Ok(Json(DirectoryResponse { entries }))
+    Ok(Json(DirectoryResponse {
+        entries: directory_entries(&state),
+    }))
+}
+
+async fn stats_ws(
+    State(app): State<App>,
+    Query(params): Query<StatsWsParams>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_stats_socket(app.state, params.session_id, socket))
+}
+
+async fn handle_stats_socket(state: SharedState, session_id: Option<Uuid>, socket: WebSocket) {
+    let (mut sender, mut receiver) = socket.split();
+    let (tx, mut rx) = mpsc::unbounded_channel::<StatsSnapshot>();
+    let subscriber_id = Uuid::new_v4();
+    let tracked_session = session_id;
+    let mut connection_id = None;
+
+    {
+        let mut locked = state.lock().await;
+        if let Some(session_id) = tracked_session {
+            if locked.sessions.contains_key(&session_id) {
+                connection_id = Some(register_presence(
+                    &mut locked,
+                    session_id,
+                    PresenceConnectionKind::Stats,
+                ));
+            }
+        }
+        locked.stats_subscribers.insert(subscriber_id, tx.clone());
+        let _ = tx.send(compute_stats(&locked));
+        broadcast_stats(&mut locked);
+    }
+
+    let send_task = tokio::spawn(async move {
+        let mut heartbeat = time::interval(HEARTBEAT_INTERVAL);
+        loop {
+            tokio::select! {
+                Some(snapshot) = rx.recv() => {
+                    let Ok(text) = serde_json::to_string(&snapshot) else {
+                        break;
+                    };
+                    if sender.send(Message::Text(text)).await.is_err() {
+                        break;
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    if sender.send(Message::Ping(Vec::new())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    while let Some(message) = receiver.next().await {
+        let Ok(message) = message else {
+            break;
+        };
+        if let Some(connection_id) = connection_id {
+            let mut locked = state.lock().await;
+            touch_presence(&mut locked, connection_id);
+        }
+        if matches!(message, Message::Close(_)) {
+            break;
+        }
+    }
+
+    send_task.abort();
+    let mut locked = state.lock().await;
+    locked.stats_subscribers.remove(&subscriber_id);
+    if let Some(connection_id) = connection_id {
+        release_presence(&mut locked, connection_id);
+    }
+    broadcast_stats(&mut locked);
 }
 
 async fn room_ws(
@@ -733,6 +1080,8 @@ async fn room_ws(
             return Err(ApiError::conflict("Room is full."));
         }
         room.participants.insert(params.session_id);
+        room.participant_joined_at
+            .insert(params.session_id, Utc::now());
     }
     Ok(ws.on_upgrade(move |socket| handle_socket(app.state, room_id, params.session_id, socket)))
 }
@@ -741,15 +1090,23 @@ async fn handle_socket(state: SharedState, room_id: Uuid, session_id: Uuid, sock
     let (mut sender, mut receiver) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerWsEvent>();
     let mut display_name = "Guest".to_string();
+    let connection_id;
 
     {
         let mut locked = state.lock().await;
         if let Some(session) = locked.sessions.get(&session_id) {
             display_name = session.display_name.clone();
         }
+        connection_id = register_presence(
+            &mut locked,
+            session_id,
+            PresenceConnectionKind::Room { room_id },
+        );
         if let Some(room) = locked.rooms.get_mut(&room_id) {
             room.senders.insert(session_id, tx.clone());
+            room.connection_ids.insert(session_id, connection_id);
         }
+        broadcast_stats(&mut locked);
         if let Ok(snapshot) = room_snapshot(&locked, room_id) {
             let _ = tx.send(ServerWsEvent::Welcome {
                 room: snapshot,
@@ -770,18 +1127,38 @@ async fn handle_socket(state: SharedState, room_id: Uuid, session_id: Uuid, sock
     }
 
     let send_task = tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            let Ok(text) = serde_json::to_string(&event) else {
-                break;
-            };
-            if sender.send(Message::Text(text)).await.is_err() {
-                break;
+        let mut heartbeat = time::interval(HEARTBEAT_INTERVAL);
+        loop {
+            tokio::select! {
+                Some(event) = rx.recv() => {
+                    let Ok(text) = serde_json::to_string(&event) else {
+                        break;
+                    };
+                    if sender.send(Message::Text(text)).await.is_err() {
+                        break;
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    if sender.send(Message::Ping(Vec::new())).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
 
-    while let Some(Ok(message)) = receiver.next().await {
+    while let Some(message) = receiver.next().await {
+        let Ok(message) = message else {
+            break;
+        };
+        {
+            let mut locked = state.lock().await;
+            touch_presence(&mut locked, connection_id);
+        }
         let Message::Text(text) = message else {
+            if matches!(message, Message::Close(_)) {
+                break;
+            }
             continue;
         };
         match serde_json::from_str::<ClientWsEvent>(&text) {
@@ -815,6 +1192,7 @@ async fn handle_socket(state: SharedState, room_id: Uuid, session_id: Uuid, sock
                     },
                 );
             }
+            Ok(ClientWsEvent::Heartbeat) => {}
             Ok(ClientWsEvent::Chat { text }) => {
                 let clipped: String = text.chars().take(500).collect();
                 let locked = state.lock().await;
@@ -846,48 +1224,8 @@ async fn handle_socket(state: SharedState, room_id: Uuid, session_id: Uuid, sock
 
     send_task.abort();
     let mut locked = state.lock().await;
-    if let Some(room) = locked.rooms.get_mut(&room_id) {
-        room.participants.remove(&session_id);
-        room.senders.remove(&session_id);
-        if room.host_session == session_id {
-            if let Some(next_host) = room
-                .participants
-                .iter()
-                .choose(&mut rand::thread_rng())
-                .copied()
-            {
-                room.host_session = next_host;
-            }
-        }
-        broadcast(
-            room_to_state_ref(&locked),
-            room_id,
-            ServerWsEvent::PeerLeft {
-                peer_id: session_id,
-            },
-        );
-    }
-    locked.directory.remove(&session_id);
-    let remove_room = locked
-        .rooms
-        .get(&room_id)
-        .is_some_and(|room| room.participants.is_empty());
-    if remove_room {
-        locked.rooms.remove(&room_id);
-        locked
-            .join_requests
-            .retain(|_, request| request.room_id != room_id);
-    } else if let Ok(snapshot) = room_snapshot(&locked, room_id) {
-        broadcast(
-            &locked,
-            room_id,
-            ServerWsEvent::RoomUpdated { room: snapshot },
-        );
-    }
-}
-
-fn room_to_state_ref(state: &AppState) -> &AppState {
-    state
+    release_presence(&mut locked, connection_id);
+    broadcast_stats(&mut locked);
 }
 
 fn find_match(
@@ -918,6 +1256,7 @@ fn join_room_locked(
         return Err(ApiError::conflict("This room is full."));
     }
     room.participants.insert(session_id);
+    room.participant_joined_at.insert(session_id, Utc::now());
     if room.participants.len() >= 2 {
         room.waiting_for_random = false;
     }
@@ -1068,6 +1407,335 @@ fn clean_name(name: String) -> String {
     } else {
         trimmed
     }
+}
+
+fn normalize_display_name(name: &str) -> String {
+    name.trim().to_ascii_lowercase()
+}
+
+fn display_name_in_use(state: &AppState, name: &str, except_session: Option<Uuid>) -> bool {
+    let normalized = normalize_display_name(name);
+    state.sessions.iter().any(|(session_id, session)| {
+        except_session != Some(*session_id)
+            && normalize_display_name(&session.display_name) == normalized
+    })
+}
+
+fn display_name_reserved_by_account(state: &AppState, name: &str) -> bool {
+    let normalized = normalize_display_name(name);
+    state
+        .users
+        .values()
+        .any(|account| normalize_display_name(&account.display_name) == normalized)
+}
+
+fn ensure_guest_display_name_available(state: &AppState, name: &str) -> Result<(), ApiError> {
+    if display_name_reserved_by_account(state, name) {
+        return Err(ApiError::conflict(
+            "That name belongs to a registered account. Choose a different guest name.",
+        ));
+    }
+    if display_name_in_use(state, name, None) {
+        return Err(ApiError::conflict(
+            "That guest name is already in use. Pick another one.",
+        ));
+    }
+    Ok(())
+}
+
+fn live_room_for_session(state: &AppState, session_id: Uuid) -> Option<Uuid> {
+    state
+        .rooms
+        .iter()
+        .find(|(_, room)| room.participants.contains(&session_id))
+        .map(|(room_id, _)| *room_id)
+}
+
+fn is_session_online(state: &AppState, session_id: Uuid) -> bool {
+    state
+        .presence_connections
+        .values()
+        .any(|connection| connection.session_id == session_id && !presence_is_stale(connection))
+}
+
+fn prune_stale_directory(state: &mut AppState) {
+    let stale: Vec<Uuid> = state
+        .directory
+        .iter()
+        .filter_map(|(session_id, entry)| {
+            (!entry.available
+                || !state.sessions.contains_key(session_id)
+                || !is_session_online(state, *session_id))
+            .then_some(*session_id)
+        })
+        .collect();
+    for session_id in stale {
+        state.directory.remove(&session_id);
+    }
+}
+
+fn directory_entries(state: &AppState) -> Vec<DirectoryEntry> {
+    let mut entries: Vec<_> = state
+        .directory
+        .values()
+        .filter(|entry| {
+            entry.available
+                && state.sessions.contains_key(&entry.session_id)
+                && is_session_online(state, entry.session_id)
+        })
+        .cloned()
+        .map(|mut entry| {
+            entry.room_id = live_room_for_session(state, entry.session_id).or(entry.room_id);
+            entry
+        })
+        .collect();
+    entries.sort_by(|a, b| a.display_name.cmp(&b.display_name));
+    entries
+}
+
+fn direct_chat_request_summary(
+    request: &DirectChatRequest,
+    viewer_session: Uuid,
+) -> DirectChatRequestSummary {
+    DirectChatRequestSummary {
+        id: request.id,
+        requester_session: request.requester_session,
+        requester_display_name: request.requester_display_name.clone(),
+        target_session: request.target_session,
+        target_display_name: request.target_display_name.clone(),
+        status: request.status,
+        room_id: request.room_id,
+        created_at: request.created_at,
+        updated_at: request.updated_at,
+        accepted_by: request.accepted_by,
+        can_accept: request.status == JoinRequestStatus::Pending
+            && request.target_session == viewer_session,
+    }
+}
+
+fn register_presence(state: &mut AppState, session_id: Uuid, kind: PresenceConnectionKind) -> Uuid {
+    let connection_id = Uuid::new_v4();
+    state.presence_connections.insert(
+        connection_id,
+        PresenceConnection {
+            session_id,
+            kind,
+            last_seen: Utc::now(),
+        },
+    );
+    connection_id
+}
+
+fn touch_presence(state: &mut AppState, connection_id: Uuid) {
+    if let Some(connection) = state.presence_connections.get_mut(&connection_id) {
+        connection.last_seen = Utc::now();
+    }
+}
+
+fn release_presence(state: &mut AppState, connection_id: Uuid) {
+    let Some(connection) = state.presence_connections.remove(&connection_id) else {
+        return;
+    };
+    match connection.kind {
+        PresenceConnectionKind::Stats => {}
+        PresenceConnectionKind::Room { room_id } => {
+            remove_room_connection(state, room_id, connection.session_id, Some(connection_id));
+        }
+    }
+}
+
+fn release_session_presence(state: &mut AppState, session_id: Uuid) {
+    let connection_ids: Vec<_> = state
+        .presence_connections
+        .iter()
+        .filter_map(|(connection_id, connection)| {
+            (connection.session_id == session_id).then_some(*connection_id)
+        })
+        .collect();
+    for connection_id in connection_ids {
+        release_presence(state, connection_id);
+    }
+}
+
+fn presence_is_stale(connection: &PresenceConnection) -> bool {
+    Utc::now()
+        .signed_duration_since(connection.last_seen)
+        .num_seconds()
+        > PRESENCE_TIMEOUT_SECONDS
+}
+
+fn prune_stale_presence(state: &mut AppState) {
+    let stale_connections: Vec<_> = state
+        .presence_connections
+        .iter()
+        .filter_map(|(connection_id, connection)| {
+            presence_is_stale(connection).then_some(*connection_id)
+        })
+        .collect();
+    for connection_id in stale_connections {
+        release_presence(state, connection_id);
+    }
+}
+
+fn prune_unconnected_room_participants(state: &mut AppState) {
+    let now = Utc::now();
+    let stale_participants: Vec<_> = state
+        .rooms
+        .iter()
+        .flat_map(|(room_id, room)| {
+            room.participants
+                .iter()
+                .filter(|session_id| !room.connection_ids.contains_key(session_id))
+                .filter_map(|session_id| {
+                    let joined_at = room
+                        .participant_joined_at
+                        .get(session_id)
+                        .copied()
+                        .unwrap_or(room.created_at);
+                    (now.signed_duration_since(joined_at).num_seconds()
+                        > PENDING_ROOM_JOIN_TIMEOUT_SECONDS)
+                        .then_some((*room_id, *session_id))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    for (room_id, session_id) in stale_participants {
+        remove_room_connection(state, room_id, session_id, None);
+    }
+}
+
+fn remove_room_connection(
+    state: &mut AppState,
+    room_id: Uuid,
+    session_id: Uuid,
+    connection_id: Option<Uuid>,
+) -> bool {
+    let should_remove = state.rooms.get(&room_id).is_some_and(|room| {
+        connection_id.is_none()
+            || room
+                .connection_ids
+                .get(&session_id)
+                .is_some_and(|active_connection_id| Some(*active_connection_id) == connection_id)
+    });
+    if !should_remove {
+        return false;
+    }
+
+    if let Some(room) = state.rooms.get_mut(&room_id) {
+        room.participants.remove(&session_id);
+        room.participant_joined_at.remove(&session_id);
+        room.senders.remove(&session_id);
+        room.connection_ids.remove(&session_id);
+        if room.host_session == session_id {
+            if let Some(next_host) = room
+                .participants
+                .iter()
+                .choose(&mut rand::thread_rng())
+                .copied()
+            {
+                room.host_session = next_host;
+            }
+        }
+    }
+
+    broadcast(
+        state,
+        room_id,
+        ServerWsEvent::PeerLeft {
+            peer_id: session_id,
+        },
+    );
+
+    if state.directory.contains_key(&session_id) {
+        let live_room_id = live_room_for_session(state, session_id);
+        if let Some(entry) = state.directory.get_mut(&session_id) {
+            entry.room_id = live_room_id;
+            entry.updated_at = Utc::now();
+        }
+    }
+
+    let remove_room = state
+        .rooms
+        .get(&room_id)
+        .is_some_and(|room| room.participants.is_empty());
+    if remove_room {
+        state.rooms.remove(&room_id);
+        state
+            .join_requests
+            .retain(|_, request| request.room_id != room_id);
+    } else if let Ok(snapshot) = room_snapshot(state, room_id) {
+        broadcast(
+            state,
+            room_id,
+            ServerWsEvent::RoomUpdated { room: snapshot },
+        );
+    }
+
+    true
+}
+
+fn compute_stats(state: &AppState) -> StatsSnapshot {
+    let in_call_count = state
+        .rooms
+        .values()
+        .flat_map(|room| room.participants.iter())
+        .collect::<HashSet<_>>()
+        .len();
+    let online_count = state
+        .presence_connections
+        .values()
+        .filter(|connection| !presence_is_stale(connection))
+        .map(|connection| connection.session_id)
+        .collect::<HashSet<_>>()
+        .len();
+    StatsSnapshot {
+        online_count,
+        in_call_count,
+    }
+}
+
+fn broadcast_stats(state: &mut AppState) {
+    prune_stale_presence(state);
+    prune_unconnected_room_participants(state);
+    let snapshot = compute_stats(state);
+    let stale_subscribers: Vec<_> = state
+        .stats_subscribers
+        .iter()
+        .filter_map(|(subscriber_id, tx)| {
+            tx.send(snapshot.clone()).is_err().then_some(*subscriber_id)
+        })
+        .collect();
+    for subscriber_id in stale_subscribers {
+        state.stats_subscribers.remove(&subscriber_id);
+    }
+}
+
+fn pending_request_count_for_room(state: &AppState, room_id: Uuid) -> usize {
+    state
+        .join_requests
+        .values()
+        .filter(|request| {
+            request.room_id == room_id && request.status == JoinRequestStatus::Pending
+        })
+        .count()
+}
+
+fn broadcast_join_requests_changed(
+    state: &AppState,
+    room_id: Uuid,
+    requester_display_name: Option<String>,
+    accepted: bool,
+) {
+    let pending_count = pending_request_count_for_room(state, room_id);
+    broadcast(
+        state,
+        room_id,
+        ServerWsEvent::JoinRequestsChanged {
+            pending_count,
+            requester_display_name,
+            accepted,
+        },
+    );
 }
 
 fn hash_password(password: &str) -> Result<String, ApiError> {
@@ -1266,8 +1934,10 @@ mod tests {
                     host_controls_joiners: true,
                     share_link_enabled: false,
                     participants: HashSet::from([s1.id]),
+                    participant_joined_at: HashMap::from([(s1.id, Utc::now())]),
                     approved_joiners: HashSet::new(),
                     senders: HashMap::new(),
+                    connection_ids: HashMap::new(),
                     waiting_for_random: true,
                     created_at: Utc::now(),
                 },
@@ -1340,6 +2010,16 @@ mod tests {
     }
 
     #[test]
+    fn peer_left_event_serializes_peer_id_for_clients() {
+        let event = ServerWsEvent::PeerLeft {
+            peer_id: Uuid::nil(),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "peerLeft");
+        assert!(json.get("peer_id").is_some());
+    }
+
+    #[test]
     fn presence_events_accept_browser_field_names() {
         let event: ClientWsEvent = serde_json::from_value(serde_json::json!({
             "type": "presence",
@@ -1363,6 +2043,322 @@ mod tests {
         }
     }
 
+    #[test]
+    fn online_stats_count_distinct_live_sessions() {
+        let mut state = AppState::default();
+        let session_id = Uuid::new_v4();
+        let first_connection =
+            register_presence(&mut state, session_id, PresenceConnectionKind::Stats);
+        let second_connection =
+            register_presence(&mut state, session_id, PresenceConnectionKind::Stats);
+
+        assert_eq!(compute_stats(&state).online_count, 1);
+        release_presence(&mut state, first_connection);
+        assert_eq!(compute_stats(&state).online_count, 1);
+        release_presence(&mut state, second_connection);
+        assert_eq!(compute_stats(&state).online_count, 0);
+    }
+
+    #[test]
+    fn stale_room_presence_removes_participant_from_counts() {
+        let mut state = AppState::default();
+        let session_id = Uuid::new_v4();
+        let room_id = Uuid::new_v4();
+        let connection_id = register_presence(
+            &mut state,
+            session_id,
+            PresenceConnectionKind::Room { room_id },
+        );
+        if let Some(connection) = state.presence_connections.get_mut(&connection_id) {
+            connection.last_seen =
+                Utc::now() - chrono::Duration::seconds(PRESENCE_TIMEOUT_SECONDS + 1);
+        }
+        state.rooms.insert(
+            room_id,
+            Room {
+                id: room_id,
+                host_session: session_id,
+                host_controls_joiners: false,
+                share_link_enabled: false,
+                participants: HashSet::from([session_id]),
+                participant_joined_at: HashMap::from([(session_id, Utc::now())]),
+                approved_joiners: HashSet::new(),
+                senders: HashMap::new(),
+                connection_ids: HashMap::from([(session_id, connection_id)]),
+                waiting_for_random: false,
+                created_at: Utc::now(),
+            },
+        );
+
+        broadcast_stats(&mut state);
+
+        assert_eq!(compute_stats(&state).online_count, 0);
+        assert_eq!(compute_stats(&state).in_call_count, 0);
+        assert!(!state.rooms.contains_key(&room_id));
+    }
+
+    #[test]
+    fn pending_room_participant_without_socket_is_pruned() {
+        let mut state = AppState::default();
+        let session_id = Uuid::new_v4();
+        let room_id = Uuid::new_v4();
+        let stale_joined_at =
+            Utc::now() - chrono::Duration::seconds(PENDING_ROOM_JOIN_TIMEOUT_SECONDS + 1);
+        state.rooms.insert(
+            room_id,
+            Room {
+                id: room_id,
+                host_session: session_id,
+                host_controls_joiners: false,
+                share_link_enabled: false,
+                participants: HashSet::from([session_id]),
+                participant_joined_at: HashMap::from([(session_id, stale_joined_at)]),
+                approved_joiners: HashSet::new(),
+                senders: HashMap::new(),
+                connection_ids: HashMap::new(),
+                waiting_for_random: true,
+                created_at: stale_joined_at,
+            },
+        );
+
+        broadcast_stats(&mut state);
+
+        assert_eq!(compute_stats(&state).in_call_count, 0);
+        assert!(!state.rooms.contains_key(&room_id));
+    }
+
+    #[tokio::test]
+    async fn directory_hides_opted_in_users_without_active_presence() {
+        let app = test_app();
+        let guest = create_session(&app, "Ghost".into(), None).await.unwrap();
+        {
+            let mut locked = app.state.lock().await;
+            locked.directory.insert(
+                guest.id,
+                DirectoryEntry {
+                    session_id: guest.id,
+                    display_name: "Ghost".into(),
+                    room_id: None,
+                    available: true,
+                    updated_at: Utc::now(),
+                },
+            );
+        }
+
+        let router = build_router_with_app(app);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/directory")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["entries"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn direct_chat_request_creates_room_on_accept() {
+        let app = test_app();
+        let router = build_router_with_app(app.clone());
+        let requester = create_session(&app, "Requester".into(), None)
+            .await
+            .unwrap();
+        let target = create_session(&app, "Target".into(), None).await.unwrap();
+        {
+            let mut locked = app.state.lock().await;
+            locked.directory.insert(
+                target.id,
+                DirectoryEntry {
+                    session_id: target.id,
+                    display_name: "Target".into(),
+                    room_id: None,
+                    available: true,
+                    updated_at: Utc::now(),
+                },
+            );
+            register_presence(&mut locked, target.id, PresenceConnectionKind::Stats);
+            register_presence(&mut locked, requester.id, PresenceConnectionKind::Stats);
+        }
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/direct-requests")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "session_id": requester.id,
+                            "target_session_id": target.id
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let request_id = payload["request"]["id"].as_str().unwrap();
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/direct-requests/{request_id}/accept"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "session_id": target.id }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["request"]["status"], "accepted");
+        assert!(payload["request"]["room_id"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn directory_lists_live_room_membership_for_opted_in_users() {
+        let app = test_app();
+        let host = create_session(&app, "Host".into(), None).await.unwrap();
+        let room_id = Uuid::new_v4();
+        {
+            let mut locked = app.state.lock().await;
+            locked.directory.insert(
+                host.id,
+                DirectoryEntry {
+                    session_id: host.id,
+                    display_name: "Host".into(),
+                    room_id: None,
+                    available: true,
+                    updated_at: Utc::now(),
+                },
+            );
+            locked.rooms.insert(
+                room_id,
+                Room {
+                    id: room_id,
+                    host_session: host.id,
+                    host_controls_joiners: false,
+                    share_link_enabled: false,
+                    participants: HashSet::from([host.id]),
+                    participant_joined_at: HashMap::from([(host.id, Utc::now())]),
+                    approved_joiners: HashSet::new(),
+                    senders: HashMap::new(),
+                    connection_ids: HashMap::new(),
+                    waiting_for_random: false,
+                    created_at: Utc::now(),
+                },
+            );
+            register_presence(
+                &mut locked,
+                host.id,
+                PresenceConnectionKind::Room { room_id },
+            );
+        }
+
+        let router = build_router_with_app(app);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/directory")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["entries"][0]["room_id"], room_id.to_string());
+    }
+
+    #[tokio::test]
+    async fn guest_name_cannot_match_registered_display_name() {
+        let router = test_router();
+        let signup_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/signup")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "email": "reserved@example.com",
+                            "password": "correct horse battery staple",
+                            "display_name": "ReservedName"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(signup_response.status(), StatusCode::OK);
+
+        let guest_response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/guest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "display_name": "ReservedName" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(guest_response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn guest_name_cannot_be_reused_by_another_session() {
+        let router = test_router();
+        let first_guest = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/guest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "display_name": "Picklewizard" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_guest.status(), StatusCode::OK);
+
+        let second_guest = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/guest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "display_name": "picklewizard" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second_guest.status(), StatusCode::CONFLICT);
+    }
+
     #[tokio::test]
     async fn accepted_directory_request_approves_join_without_share_link() {
         let app = test_app();
@@ -1380,8 +2376,10 @@ mod tests {
                     host_controls_joiners: false,
                     share_link_enabled: false,
                     participants: HashSet::from([host.id]),
+                    participant_joined_at: HashMap::from([(host.id, Utc::now())]),
                     approved_joiners: HashSet::new(),
                     senders: HashMap::new(),
+                    connection_ids: HashMap::new(),
                     waiting_for_random: false,
                     created_at: Utc::now(),
                 },

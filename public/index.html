@@ -7,6 +7,21 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
+    <header id="siteStatsHeader" class="site-stats-header">
+      <div class="site-stats-header-inner">
+        <div id="liveStatsBar" class="live-stats-bar" aria-live="polite" aria-label="Live site activity">
+          <div class="live-stat">
+            <span id="onlineCount" class="live-stat-value">0</span>
+            <span class="live-stat-label">online</span>
+          </div>
+          <div class="live-stat">
+            <span id="inCallCount" class="live-stat-value">0</span>
+            <span class="live-stat-label">in video chat</span>
+          </div>
+        </div>
+      </div>
+    </header>
+
     <main id="lobbyView" class="app-shell">
       <section class="hero-panel">
         <div class="hero-copy">
@@ -64,19 +79,43 @@
             <label class="check"><input id="hostControls" type="checkbox" /> Let only the host call in random joiners</label>
           </div>
           <button id="startRoomButton">Start or find a room</button>
-          <p id="roomLaunchStatus" class="hint">Rooms support up to 8 people. Host-control rooms are matched carefully to avoid control conflicts.</p>
+          <p id="roomLaunchStatus" class="hint">Rooms support up to 8 people.</p>
         </section>
+      </section>
+
+      <section id="lobbyRequestsSection" class="surface requests-hub-panel">
+        <div class="requests-hub-head">
+          <div>
+            <p class="eyebrow">Your activity</p>
+            <h2>Requests</h2>
+          </div>
+          <span id="lobbyOutgoingCount" class="count-chip hidden">0 open</span>
+        </div>
+        <p id="lobbyRequestsStatus" class="hint">Track chat and room requests. Join as soon as someone accepts you.</p>
+        <div class="request-section">
+          <h3>Waiting on you</h3>
+          <div id="lobbyIncomingRequests" class="request-list"></div>
+        </div>
+        <div class="request-section">
+          <h3>Requests you sent</h3>
+          <div id="lobbyOutgoingRequests" class="request-list"></div>
+        </div>
       </section>
 
       <section id="directorySection" class="surface directory-panel">
         <div class="directory-head">
           <div>
             <p class="eyebrow">Global directory</p>
-            <h2>Live room directory</h2>
+            <h2>Find people to talk with</h2>
           </div>
           <label class="check switch-row"><input id="directoryOptIn" type="checkbox" /> List me while online</label>
         </div>
-        <p id="directoryStatus" class="hint">Start a session to send and accept requests.</p>
+        <p id="directoryStatus" class="hint">Browse people who opted in. Request to join anyone currently in a room.</p>
+        <div class="directory-filters" role="tablist" aria-label="Directory filters">
+          <button type="button" id="directoryFilterAll" class="filter-chip active" data-filter="all">All</button>
+          <button type="button" id="directoryFilterInRoom" class="filter-chip" data-filter="in-room">In rooms</button>
+          <button type="button" id="directoryFilterAvailable" class="filter-chip" data-filter="available">Available</button>
+        </div>
         <div id="directory" class="directory"></div>
       </section>
     </main>
@@ -88,6 +127,13 @@
           <h1 id="inviteRoomTitle">Request to join</h1>
           <p id="inviteStatus" class="lede">Choose a name, start a session, then send a request to the people already in this room.</p>
         </div>
+
+        <ol id="inviteSteps" class="invite-steps" aria-label="Join progress">
+          <li id="inviteStepSignIn" class="invite-step active">Sign in</li>
+          <li id="inviteStepRequest" class="invite-step">Send request</li>
+          <li id="inviteStepWait" class="invite-step">Wait for approval</li>
+          <li id="inviteStepJoin" class="invite-step">Join room</li>
+        </ol>
 
         <section class="invite-grid">
           <form id="inviteAuthForm" class="surface nested stack">
@@ -120,9 +166,13 @@
               </div>
               <button type="button" id="inviteLogoutButton" class="secondary hidden">Sign out</button>
             </div>
+            <div id="inviteRequestState" class="request-state-card waiting">
+              <strong id="inviteRequestStateTitle">Start a session first</strong>
+              <p id="inviteRequestStateCopy" class="hint">Sign in as a guest or local account, then ask to enter this room.</p>
+            </div>
             <button id="inviteRequestButton" disabled>Request to join</button>
-            <button id="inviteJoinButton" class="hidden">Join room</button>
-            <p class="hint">Requests appear quietly inside the room. Someone already inside can accept you from the request panel.</p>
+            <button id="inviteJoinButton" class="hidden">Join room now</button>
+            <p class="hint">Someone in the room will see your request and can let you in from the Requests panel.</p>
           </section>
         </section>
       </section>
@@ -136,6 +186,10 @@
           <p id="roomMeta"></p>
         </div>
         <div class="room-pills" aria-label="Room status">
+          <button type="button" id="pendingRequestsChip" class="pending-requests-chip hidden" aria-label="Open pending join requests">
+            <span id="pendingRequestsCount">0</span>
+            <span class="pending-requests-label">requests</span>
+          </button>
           <span id="roomStatusPill" class="room-pill">Connecting</span>
           <span id="roomHostPill" class="room-pill">Host pending</span>
           <span id="roomCapacityPill" class="room-pill">0/8</span>
@@ -150,6 +204,7 @@
         <section class="video-stage" aria-label="Video call">
           <div class="stage-header">
             <p id="roomNotice" class="meeting-notice">Preparing the room...</p>
+            <div id="requestAlert" class="request-alert hidden" role="status" aria-live="polite"></div>
             <div class="layout-segment" aria-label="Video layout">
               <button type="button" id="gridLayoutButton" class="active">Grid</button>
               <button type="button" id="focusLayoutButton">Focus</button>
@@ -162,7 +217,7 @@
           <nav class="sidebar-tabs" aria-label="Room panel tabs">
             <button type="button" id="tabChat" class="active">Chat</button>
             <button type="button" id="tabPeople">People</button>
-            <button type="button" id="tabRequests">Requests</button>
+            <button type="button" id="tabRequests">Requests <span id="tabRequestsBadge" class="tab-badge hidden">0</span></button>
             <button type="button" id="tabSettings">Settings</button>
           </nav>
 
@@ -191,9 +246,12 @@
               <p class="eyebrow">Access</p>
               <h2>Join requests</h2>
             </div>
-            <p id="requestStatus" class="hint">Start a session to send and accept requests.</p>
-            <div class="request-section">
-              <h3>Requests to this room</h3>
+            <p id="requestStatus" class="hint">People asking to enter this room appear here.</p>
+            <div class="request-section highlight-section">
+              <div class="request-section-head">
+                <h3>Waiting to enter</h3>
+                <span id="incomingRequestsCount" class="count-chip hidden">0</span>
+              </div>
               <div id="incomingRequests" class="request-list"></div>
             </div>
             <div class="request-section">
@@ -224,6 +282,7 @@
         <button id="screenButton" type="button" class="control-button secondary" aria-pressed="false">Share screen</button>
         <button id="chatToggleButton" type="button" class="control-button secondary">Chat</button>
         <button id="peopleToggleButton" type="button" class="control-button secondary">People</button>
+        <button id="requestsToggleButton" type="button" class="control-button secondary">Requests <span id="dockRequestsBadge" class="dock-badge hidden">0</span></button>
         <button id="settingsToggleButton" type="button" class="control-button secondary">Settings</button>
         <button id="leaveButton" type="button" class="control-button danger">Leave</button>
       </footer>

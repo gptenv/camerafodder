@@ -1,6 +1,6 @@
 const $ = (id) => document.getElementById(id);
 const state = {
-  session: JSON.parse(localStorage.getItem('cameraFodderSession') || 'null'),
+  session: JSON.parse(sessionStorage.getItem('cameraFodderSession') || 'null'),
   room: null,
   ws: null,
   localStream: null,
@@ -10,7 +10,10 @@ const state = {
   participants: new Map(),
   mediaByPeer: new Map(),
   roomEpoch: 0,
-  joinRequests: { incoming: [], outgoing: [] },
+  joinRequests: { incoming: [], outgoing: [], directIncoming: [], directOutgoing: [] },
+  directoryFilter: 'all',
+  lastPendingIncomingCount: 0,
+  requestAlertTimer: null,
   pendingRoomId: roomIdFromLocation(),
   layoutMode: localStorage.getItem('cameraFodderLayout') || 'grid',
   activeVideoId: 'local',
@@ -27,6 +30,98 @@ const state = {
 };
 
 const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+const FUNNY_NAMES = [
+  'Wobblepants', 'Snickerdoodle', 'Bananarama', 'Picklewizard', 'Noodlemeister',
+  'Gigglemuffin', 'Zippityzoom', 'Floofington', 'Squishbean', 'Bumblewink',
+  'Kerfluffle', 'Dingleberry', 'Bonkersworth', 'Squonkmaster', 'Wombleton',
+  'Yeehawski', 'Blimposaur', 'Crumpetlord', 'Muffinmancer', 'Puddlepants',
+  'Snorfle', 'Wigglybean', 'Taterwizard', 'Boopnugget', 'Chonkalope',
+];
+let statsWs = null;
+let statsReconnectTimer = null;
+let statsHeartbeatTimer = null;
+let roomHeartbeatTimer = null;
+
+function randomDisplayName() {
+  return FUNNY_NAMES[Math.floor(Math.random() * FUNNY_NAMES.length)];
+}
+
+function populateDisplayNameFields() {
+  const name = randomDisplayName();
+  if ($('displayName')) $('displayName').value = name;
+  if ($('inviteDisplayName')) $('inviteDisplayName').value = name;
+}
+
+function updateLiveStats(stats) {
+  if ($('onlineCount')) $('onlineCount').textContent = String(stats.online_count ?? 0);
+  if ($('inCallCount')) $('inCallCount').textContent = String(stats.in_call_count ?? 0);
+}
+
+function stopStatsHeartbeat() {
+  if (statsHeartbeatTimer) {
+    clearInterval(statsHeartbeatTimer);
+    statsHeartbeatTimer = null;
+  }
+}
+
+function startStatsHeartbeat() {
+  stopStatsHeartbeat();
+  const heartbeat = () => {
+    if (statsWs?.readyState === WebSocket.OPEN) {
+      statsWs.send(JSON.stringify({ type: 'heartbeat' }));
+    }
+  };
+  heartbeat();
+  statsHeartbeatTimer = setInterval(heartbeat, 15000);
+}
+
+function connectStatsWs() {
+  if (statsReconnectTimer) {
+    clearTimeout(statsReconnectTimer);
+    statsReconnectTimer = null;
+  }
+  stopStatsHeartbeat();
+  if (statsWs) {
+    statsWs.onclose = null;
+    statsWs.close();
+    statsWs = null;
+  }
+  const query = state.session?.id ? `?session_id=${state.session.id}` : '';
+  const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/stats${query}`;
+  statsWs = new WebSocket(wsUrl);
+  statsWs.onopen = () => {
+    startStatsHeartbeat();
+    if (state.session && $('directoryOptIn')?.checked) {
+      updateDirectory().catch(console.warn);
+    }
+  };
+  statsWs.onmessage = ({ data }) => {
+    try {
+      updateLiveStats(JSON.parse(data));
+    } catch (error) {
+      console.warn('Unable to parse live stats update', error);
+    }
+  };
+  statsWs.onclose = () => {
+    stopStatsHeartbeat();
+    statsWs = null;
+    statsReconnectTimer = setTimeout(connectStatsWs, 3000);
+  };
+}
+
+function stopRoomHeartbeat() {
+  if (roomHeartbeatTimer) {
+    clearInterval(roomHeartbeatTimer);
+    roomHeartbeatTimer = null;
+  }
+}
+
+function startRoomHeartbeat() {
+  stopRoomHeartbeat();
+  const heartbeat = () => send({ type: 'heartbeat' });
+  heartbeat();
+  roomHeartbeatTimer = setInterval(heartbeat, 15000);
+}
 
 function roomIdFromLocation() {
   const [, section, roomId] = location.pathname.match(/^\/(room)\/([^/?#]+)/) || [];
@@ -72,12 +167,13 @@ function showRoomView(roomId, replace = false) {
 
 function setSession(session) {
   state.session = session;
-  localStorage.setItem('cameraFodderSession', JSON.stringify(session));
+  sessionStorage.setItem('cameraFodderSession', JSON.stringify(session));
+  connectStatsWs();
   $('connectionDot').classList.add('on');
   $('sessionName').textContent = session.display_name;
   $('sessionId').textContent = session.id;
   $('logoutButton').classList.remove('hidden');
-  $('authStatus').textContent = `Signed in as ${session.display_name}.`;
+  updateAuthFormState();
   $('inviteConnectionDot').classList.add('on');
   $('inviteSessionName').textContent = session.display_name;
   $('inviteSessionId').textContent = session.id;
@@ -90,18 +186,48 @@ function setSession(session) {
 
 function clearSession(message = 'Use guest mode, or create/sign into a local account.') {
   state.session = null;
-  localStorage.removeItem('cameraFodderSession');
+  sessionStorage.removeItem('cameraFodderSession');
+  connectStatsWs();
   $('connectionDot').classList.remove('on');
   $('sessionName').textContent = 'Not signed in';
   $('sessionId').textContent = 'Use guest mode or local auth to begin.';
   $('logoutButton').classList.add('hidden');
-  $('authStatus').textContent = message;
+  updateAuthFormState(message);
   $('inviteConnectionDot').classList.remove('on');
   $('inviteSessionName').textContent = 'Not signed in';
   $('inviteSessionId').textContent = 'Start a guest or local account session first.';
   $('inviteLogoutButton').classList.add('hidden');
-  state.joinRequests = { incoming: [], outgoing: [] };
+  state.joinRequests = { incoming: [], outgoing: [], directIncoming: [], directOutgoing: [] };
   renderJoinRequests();
+}
+
+function updateAuthFormState(message = null) {
+  const signedIn = Boolean(state.session?.id);
+  const fields = ['displayName', 'email', 'password', 'inviteDisplayName', 'inviteEmail', 'invitePassword'];
+  const buttons = ['guestButton', 'signupButton', 'signinButton', 'inviteGuestButton', 'inviteSignupButton', 'inviteSigninButton'];
+  for (const id of fields) {
+    const el = $(id);
+    if (el) el.disabled = signedIn;
+  }
+  for (const id of buttons) {
+    const el = $(id);
+    if (el) el.disabled = signedIn;
+  }
+  if ($('authStatus')) {
+    $('authStatus').textContent = message
+      || (signedIn
+        ? `Signed in as ${state.session.display_name}. Sign out to switch accounts.`
+        : 'Use guest mode, or create/sign into a local account.');
+  }
+}
+
+function clampRoomSize(value) {
+  let size = Number(value ?? $('roomSize')?.value ?? 2);
+  if (!Number.isFinite(size) || size < 2) size = 2;
+  if (size > 8) size = 8;
+  size = Math.round(size);
+  if ($('roomSize')) $('roomSize').value = String(size);
+  return size;
 }
 
 async function validateStoredSession() {
@@ -290,9 +416,37 @@ function ensureVideoCard(id, label) {
 }
 
 function removeVideo(id) {
-  document.querySelector(`[data-video-id="${id}"]`)?.remove();
+  const card = document.querySelector(`[data-video-id="${id}"]`);
+  if (!card) return;
+  const video = card.querySelector('video');
+  if (video) {
+    video.srcObject = null;
+    video.load();
+  }
+  card.remove();
   if (state.activeVideoId === id) state.activeVideoId = 'local';
   updateVideoLayout();
+}
+
+function removePeer(id) {
+  state.peers.get(id)?.pc.close();
+  state.peers.delete(id);
+  state.participants.delete(id);
+  state.mediaByPeer.delete(id);
+  removeVideo(id);
+}
+
+function syncVideosWithParticipants(room) {
+  const activeIds = new Set(['local']);
+  for (const participant of room.participants || []) {
+    activeIds.add(participant.session_id === state.session?.id ? 'local' : participant.session_id);
+  }
+  for (const peerId of [...state.peers.keys()]) {
+    if (!activeIds.has(peerId)) removePeer(peerId);
+  }
+  for (const card of [...document.querySelectorAll('#videos .video-card')]) {
+    if (!activeIds.has(card.dataset.videoId)) removeVideo(card.dataset.videoId);
+  }
 }
 
 function stopLocalMedia() {
@@ -380,6 +534,10 @@ function setActivePanel(panel) {
   for (const [name, [panelId, tabId]] of Object.entries(panels)) {
     $(panelId)?.classList.toggle('active', name === panel);
     $(tabId)?.classList.toggle('active', name === panel);
+  }
+  if (panel === 'requests') {
+    $('requestAlert')?.classList.add('hidden');
+    $('pendingRequestsChip')?.classList.remove('pulse');
   }
 }
 
@@ -605,9 +763,11 @@ async function joinRoom(room, options = {}) {
   }
   else $('roomMeta').textContent = 'Joining shared room…';
   const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/rooms/${room.id}?session_id=${state.session.id}`;
+  stopRoomHeartbeat();
   if (state.ws) state.ws.onclose = null;
   state.ws?.close();
   state.ws = new WebSocket(wsUrl);
+  state.ws.onopen = startRoomHeartbeat;
   state.ws.onmessage = async ({ data }) => {
     if (!isActiveRoom(room.id, roomEpoch)) return;
     const event = JSON.parse(data);
@@ -627,6 +787,7 @@ async function joinRoom(room, options = {}) {
       if (!isActiveRoom(room.id, roomEpoch)) return;
       setRoomNotice('Connected. You can manage media and settings from the control dock.');
       broadcastPresence();
+      updateDirectory().catch(console.warn);
       for (const peer of event.room.participants.filter((p) => p.session_id !== state.session.id)) {
         if (!isActiveRoom(room.id, roomEpoch)) return;
         await createPeer(peer.session_id, roomEpoch);
@@ -641,12 +802,9 @@ async function joinRoom(room, options = {}) {
     }
     if (event.type === 'peerLeft') {
       if (!isActiveRoom(room.id, roomEpoch)) return;
-      state.peers.get(event.peer_id)?.pc.close();
-      state.peers.delete(event.peer_id);
-      state.participants.delete(event.peer_id);
-      state.mediaByPeer.delete(event.peer_id);
+      const peerId = event.peerId ?? event.peer_id;
+      if (peerId) removePeer(peerId);
       renderParticipants();
-      removeVideo(event.peer_id);
     }
     if (event.type === 'signal') await handleSignal(event.from, event.payload, roomEpoch);
     if (event.type === 'presence') {
@@ -663,11 +821,19 @@ async function joinRoom(room, options = {}) {
       if (!isActiveRoom(room.id, roomEpoch)) return;
       state.room = event.room;
       rememberParticipants(event.room);
+      syncVideosWithParticipants(event.room);
       renderRoomMeta(event.room);
+    }
+    if (event.type === 'joinRequestsChanged') {
+      if (!isActiveRoom(room.id, roomEpoch)) return;
+      handleJoinRequestsChanged(event).catch(console.warn);
     }
     if (event.type === 'error') appendMessage(`Server: ${event.message}`);
   };
-  state.ws.onclose = () => appendMessage('Disconnected from room.');
+  state.ws.onclose = () => {
+    stopRoomHeartbeat();
+    appendMessage('Disconnected from room.');
+  };
 }
 
 function renderRoomMeta(room) {
@@ -683,6 +849,7 @@ function renderRoomMeta(room) {
 
 function rememberParticipants(room) {
   state.participants.clear();
+  syncVideosWithParticipants(room);
   for (const participant of room.participants || []) {
     state.participants.set(participant.session_id, participant);
     const videoId = participant.session_id === state.session?.id ? 'local' : participant.session_id;
@@ -767,16 +934,173 @@ function formatRoomId(roomId) {
 }
 
 function setRequestStatus(message) {
-  const text = message || (state.session
-    ? 'Requests are checked quietly in the background.'
-    : 'Start a session to send and accept requests.');
-  $('requestStatus').textContent = text;
-  if ($('directoryStatus')) $('directoryStatus').textContent = text;
+  const text = message || (state.session ? '' : 'Start a session to send and accept requests.');
+  if ($('requestStatus')) $('requestStatus').textContent = text;
+  if (message && $('directoryStatus') && !state.session) $('directoryStatus').textContent = message;
   if (message && $('inviteStatus')) $('inviteStatus').textContent = message;
+  if (message && $('lobbyRequestsStatus')) $('lobbyRequestsStatus').textContent = message;
+}
+
+function pendingIncomingRequests() {
+  return state.joinRequests.incoming.filter((request) => request.status === 'pending');
+}
+
+function pendingOutgoingRequests() {
+  return [
+    ...state.joinRequests.outgoing.filter((request) => request.status === 'pending'),
+    ...state.joinRequests.directOutgoing.filter((request) => request.status === 'pending'),
+  ];
+}
+
+function updateRequestIndicators({ pulse = false } = {}) {
+  const count = state.room ? pendingIncomingRequests().length : 0;
+  const countText = String(count);
+  const show = count > 0;
+
+  for (const id of ['pendingRequestsChip', 'tabRequestsBadge', 'dockRequestsBadge', 'incomingRequestsCount', 'lobbyOutgoingCount']) {
+    const el = $(id);
+    if (!el) continue;
+    if (id === 'pendingRequestsChip') {
+      el.classList.toggle('hidden', !show);
+      el.classList.toggle('pulse', pulse && show);
+      if (pulse && show) setTimeout(() => el.classList.remove('pulse'), 2400);
+    } else if (id === 'lobbyOutgoingCount') {
+      const outgoing = pendingOutgoingRequests().length;
+      el.classList.toggle('hidden', outgoing === 0);
+      el.textContent = `${outgoing} open`;
+    } else {
+      el.classList.toggle('hidden', !show);
+      el.textContent = countText;
+    }
+  }
+
+  if ($('pendingRequestsCount')) $('pendingRequestsCount').textContent = countText;
+  state.lastPendingIncomingCount = count;
+}
+
+function showRequestAlert(message) {
+  const alert = $('requestAlert');
+  if (!alert) return;
+  alert.textContent = message;
+  alert.classList.remove('hidden');
+  if (state.requestAlertTimer) clearTimeout(state.requestAlertTimer);
+  state.requestAlertTimer = setTimeout(() => alert.classList.add('hidden'), 8000);
+}
+
+async function handleJoinRequestsChanged(event) {
+  const previous = state.lastPendingIncomingCount;
+  await refreshJoinRequests();
+  const requester = event.requesterDisplayName ?? event.requester_display_name;
+  if (event.accepted && requester) {
+    showRequestAlert(`${requester} was approved to join.`);
+    setRequestStatus(`Accepted ${requester}.`);
+    return;
+  }
+  const count = event.pendingCount ?? event.pending_count ?? pendingIncomingRequests().length;
+  if (count > previous && requester) {
+    showRequestAlert(`${requester} requested to join this room.`);
+    setRoomNotice(`${requester} wants to join. Open Requests to respond.`);
+    updateRequestIndicators({ pulse: true });
+    return;
+  }
+  updateRequestIndicators();
 }
 
 function outgoingRequestForRoom(roomId) {
-  return state.joinRequests.outgoing.find((request) => request.room_id === roomId);
+  return state.joinRequests.outgoing.find((request) => String(request.room_id) === String(roomId));
+}
+
+function directRequestForTarget(targetSessionId) {
+  return state.joinRequests.directOutgoing.find(
+    (request) => String(request.target_session ?? request.targetSession) === String(targetSessionId),
+  );
+}
+
+function normalizeJoinRequests(payload) {
+  return {
+    incoming: payload.incoming || [],
+    outgoing: payload.outgoing || [],
+    directIncoming: payload.direct_incoming || payload.directIncoming || [],
+    directOutgoing: payload.direct_outgoing || payload.directOutgoing || [],
+  };
+}
+
+function directoryRoomId(entry) {
+  return entry.roomId ?? entry.room_id ?? null;
+}
+
+function directorySessionId(entry) {
+  return String(entry.sessionId ?? entry.session_id ?? '');
+}
+
+function renderInviteSteps(roomId, existing) {
+  const steps = {
+    signIn: $('inviteStepSignIn'),
+    request: $('inviteStepRequest'),
+    wait: $('inviteStepWait'),
+    join: $('inviteStepJoin'),
+  };
+  for (const step of Object.values(steps)) step?.classList.remove('active', 'done');
+
+  if (!state.session) {
+    steps.signIn?.classList.add('active');
+    return;
+  }
+  steps.signIn?.classList.add('done');
+  if (state.room?.id === roomId) {
+    steps.request?.classList.add('done');
+    steps.wait?.classList.add('done');
+    steps.join?.classList.add('done', 'active');
+    return;
+  }
+  if (existing?.status === 'accepted') {
+    steps.request?.classList.add('done');
+    steps.wait?.classList.add('done');
+    steps.join?.classList.add('active');
+    return;
+  }
+  if (existing?.status === 'pending') {
+    steps.request?.classList.add('done');
+    steps.wait?.classList.add('active');
+    return;
+  }
+  steps.request?.classList.add('active');
+}
+
+function updateInviteRequestState(roomId, existing) {
+  const card = $('inviteRequestState');
+  const title = $('inviteRequestStateTitle');
+  const copy = $('inviteRequestStateCopy');
+  if (!card || !title || !copy) return;
+
+  card.classList.remove('waiting', 'ready', 'accepted');
+  if (!state.session) {
+    card.classList.add('waiting');
+    title.textContent = 'Start a session first';
+    copy.textContent = 'Sign in as a guest or local account, then ask to enter this room.';
+    return;
+  }
+  if (state.room?.id === roomId) {
+    card.classList.add('accepted');
+    title.textContent = 'You are already inside';
+    copy.textContent = 'This invite link points to the room you are currently in.';
+    return;
+  }
+  if (existing?.status === 'pending') {
+    card.classList.add('waiting');
+    title.textContent = 'Request sent';
+    copy.textContent = 'Hang tight. Someone in the room can approve you from their Requests panel.';
+    return;
+  }
+  if (existing?.status === 'accepted') {
+    card.classList.add('accepted');
+    title.textContent = 'You are approved';
+    copy.textContent = 'Your request was accepted. Join the room whenever you are ready.';
+    return;
+  }
+  card.classList.add('ready');
+  title.textContent = `Signed in as ${state.session.display_name}`;
+  copy.textContent = `Send a request to enter ${formatRoomId(roomId)}.`;
 }
 
 function renderInviteState() {
@@ -794,6 +1118,8 @@ function renderInviteState() {
   }
 
   const existing = outgoingRequestForRoom(roomId);
+  renderInviteSteps(roomId, existing);
+  updateInviteRequestState(roomId, existing);
   $('inviteJoinButton').classList.add('hidden');
   $('inviteRequestButton').classList.remove('hidden');
 
@@ -808,7 +1134,7 @@ function renderInviteState() {
   } else if (existing?.status === 'pending') {
     $('inviteStatus').textContent = 'Request sent. Waiting for someone in the room to accept it.';
     $('inviteRequestButton').disabled = true;
-    $('inviteRequestButton').textContent = 'Request sent';
+    $('inviteRequestButton').textContent = 'Request pending';
   } else if (existing?.status === 'accepted') {
     $('inviteStatus').textContent = 'Your request was accepted. You can join the room now.';
     $('inviteRequestButton').classList.add('hidden');
@@ -821,75 +1147,161 @@ function renderInviteState() {
   }
 }
 
+function directoryMatchesFilter(entry) {
+  const roomId = directoryRoomId(entry);
+  if (state.directoryFilter === 'in-room') return Boolean(roomId);
+  if (state.directoryFilter === 'available') return !roomId;
+  return true;
+}
+
+function requestStatusForRoom(roomId) {
+  const existing = outgoingRequestForRoom(roomId);
+  if (!existing) return null;
+  return existing.status;
+}
+
+function requestStatusForAvailable(entry) {
+  const targetId = directorySessionId(entry);
+  const direct = directRequestForTarget(targetId);
+  if (direct?.status === 'pending') return 'pending';
+  if (direct?.status === 'accepted') return 'accepted';
+  return null;
+}
+
+function buildDirectoryCard(entry) {
+  const roomId = directoryRoomId(entry);
+  const card = document.createElement('article');
+  card.className = 'person-card';
+
+  const top = document.createElement('div');
+  top.className = 'person-card-top';
+
+  const avatar = document.createElement('span');
+  avatar.className = 'person-avatar';
+  avatar.textContent = initials(entry.display_name);
+
+  const copy = document.createElement('div');
+  copy.className = 'person-card-copy';
+  const name = document.createElement('strong');
+  name.textContent = entry.display_name;
+  const pill = document.createElement('span');
+  const requestStatus = roomId ? requestStatusForRoom(roomId) : requestStatusForAvailable(entry);
+  if (directorySessionId(entry) === String(state.session?.id || '')) {
+    pill.className = 'status-pill available';
+    pill.textContent = 'You';
+  } else if (requestStatus === 'pending') {
+    pill.className = 'status-pill pending';
+    pill.textContent = 'Request sent';
+  } else if (requestStatus === 'accepted') {
+    pill.className = 'status-pill accepted';
+    pill.textContent = 'Approved';
+  } else if (roomId) {
+    pill.className = 'status-pill in-room';
+    pill.textContent = formatRoomId(roomId);
+  } else {
+    pill.className = 'status-pill available';
+    pill.textContent = 'Available';
+  }
+  copy.append(name, pill);
+  top.append(avatar, copy);
+  card.append(top);
+
+  const actions = document.createElement('div');
+  actions.className = 'person-actions';
+
+  if (directorySessionId(entry) === String(state.session?.id || '')) {
+    const self = document.createElement('small');
+    self.textContent = 'This is your listing';
+    actions.append(self);
+  } else if (roomId) {
+    const existing = outgoingRequestForRoom(roomId);
+    const button = document.createElement('button');
+    button.type = 'button';
+    if (!state.session) {
+      button.disabled = true;
+      button.textContent = 'Start session to request';
+    } else if (String(state.room?.id) === String(roomId)) {
+      button.disabled = true;
+      button.className = 'secondary';
+      button.textContent = 'Already in room';
+    } else if (existing?.status === 'pending') {
+      button.disabled = true;
+      button.className = 'secondary';
+      button.textContent = 'Waiting for approval';
+    } else if (existing?.status === 'accepted') {
+      button.textContent = 'Join room';
+      button.onclick = () => joinAcceptedRoom(existing);
+    } else {
+      button.textContent = 'Request to join room';
+      button.onclick = () => sendJoinRequest(roomId);
+    }
+    actions.append(button);
+    const link = document.createElement('button');
+    link.type = 'button';
+    link.className = 'secondary';
+    link.textContent = 'Open invite page';
+    link.onclick = () => showInviteView(roomId);
+    actions.append(link);
+  } else {
+    const targetSessionId = directorySessionId(entry);
+    const existing = directRequestForTarget(targetSessionId);
+    const button = document.createElement('button');
+    button.type = 'button';
+    if (!state.session) {
+      button.disabled = true;
+      button.textContent = 'Start session to request';
+    } else if (existing?.status === 'pending') {
+      button.disabled = true;
+      button.className = 'secondary';
+      button.textContent = 'Chat requested';
+    } else if (existing?.status === 'accepted' && existing.room_id) {
+      button.textContent = 'Join chat';
+      button.onclick = () => joinDirectChatRoom(existing);
+    } else {
+      button.textContent = 'Request chat';
+      button.onclick = () => sendDirectChatRequest(targetSessionId, entry.display_name);
+    }
+    actions.append(button);
+  }
+
+  if (actions.children.length) card.append(actions);
+  return card;
+}
+
 async function refreshDirectory() {
   const { entries } = await api('/api/directory', null, 'GET');
+  const filtered = entries.filter(directoryMatchesFilter);
   $('directory').innerHTML = '';
-  if (!entries.length) {
+  if (!filtered.length) {
     const empty = document.createElement('p');
     empty.className = 'hint';
-    empty.textContent = 'Nobody is listed yet. Opt in to appear here while online.';
+    empty.textContent = entries.length
+      ? 'No directory entries match this filter.'
+      : 'Nobody is listed yet. Opt in to appear here while online.';
     $('directory').append(empty);
     return;
   }
-  for (const entry of entries) {
-    const card = document.createElement('div');
-    card.className = 'person';
-    const name = document.createElement('strong');
-    name.textContent = entry.display_name;
-    const status = document.createElement('small');
-    status.textContent = entry.room_id ? `In ${formatRoomId(entry.room_id)}` : 'Available';
-    const actions = document.createElement('div');
-    actions.className = 'person-actions';
-
-    if (entry.session_id === state.session?.id) {
-      const self = document.createElement('small');
-      self.textContent = 'This is you';
-      actions.append(self);
-    } else if (entry.room_id) {
-      const existing = outgoingRequestForRoom(entry.room_id);
-      const button = document.createElement('button');
-      button.type = 'button';
-      button.className = 'secondary';
-      if (!state.session) {
-        button.disabled = true;
-        button.textContent = 'Start session to request';
-      } else if (state.room?.id === entry.room_id) {
-        button.disabled = true;
-        button.textContent = 'Already in room';
-      } else if (existing?.status === 'pending') {
-        button.disabled = true;
-        button.textContent = 'Requested';
-      } else if (existing?.status === 'accepted') {
-        button.textContent = 'Join room';
-        button.onclick = () => joinAcceptedRoom(existing);
-      } else {
-        button.textContent = 'Request to join';
-        button.onclick = () => sendJoinRequest(entry.room_id);
-      }
-      actions.append(button);
-    }
-
-    card.append(name, status);
-    if (actions.children.length) card.append(actions);
-    $('directory').append(card);
-  }
+  for (const entry of filtered) $('directory').append(buildDirectoryCard(entry));
 }
 
 async function refreshJoinRequests() {
   if (!state.session) {
-    state.joinRequests = { incoming: [], outgoing: [] };
+    state.joinRequests = { incoming: [], outgoing: [], directIncoming: [], directOutgoing: [] };
     renderJoinRequests();
     return;
   }
   const query = new URLSearchParams({ session_id: state.session.id });
-  state.joinRequests = await api(`/api/join-requests?${query}`, null, 'GET');
+  state.joinRequests = normalizeJoinRequests(await api(`/api/join-requests?${query}`, null, 'GET'));
   renderJoinRequests();
 }
 
 function renderJoinRequests() {
   renderIncomingRequests();
   renderOutgoingRequests();
+  renderLobbyIncomingRequests();
+  renderLobbyOutgoingRequests();
   renderInviteState();
+  updateRequestIndicators();
 }
 
 function renderIncomingRequests() {
@@ -903,24 +1315,34 @@ function renderIncomingRequests() {
     appendHint(list, 'Start or join a room to receive requests.');
     return;
   }
-  if (!state.joinRequests.incoming.length) {
-    appendHint(list, 'No pending requests.');
+  const pending = pendingIncomingRequests();
+  if (!pending.length) {
+    appendHint(list, 'No one is waiting to enter right now.');
     return;
   }
-  for (const request of state.joinRequests.incoming) {
-    const card = requestCard(
-      `${request.requester_display_name} wants to join`,
-      `${formatRoomId(request.room_id)} · ${request.status}`
-    );
+  for (const request of pending) {
+    const card = document.createElement('div');
+    card.className = 'request-card incoming';
+    const heading = document.createElement('strong');
+    heading.textContent = request.requester_display_name;
+    const detail = document.createElement('span');
+    detail.className = 'request-meta';
+    detail.textContent = `Wants to join ${formatRoomId(request.room_id)}`;
+    const actions = document.createElement('div');
+    actions.className = 'request-card-actions';
     if (request.can_accept) {
       const button = document.createElement('button');
       button.type = 'button';
-      button.textContent = 'Accept';
+      button.textContent = 'Let them in';
       button.onclick = () => acceptJoinRequest(request);
-      card.append(button);
+      actions.append(button);
     } else {
-      appendHint(card, request.room_is_full ? 'Room is full.' : 'Only the host can accept this request.');
+      const hint = document.createElement('small');
+      hint.className = 'hint';
+      hint.textContent = request.room_is_full ? 'Room is full.' : 'Only the host can accept this request.';
+      actions.append(hint);
     }
+    card.append(heading, detail, actions);
     list.append(card);
   }
 }
@@ -937,20 +1359,142 @@ function renderOutgoingRequests() {
     return;
   }
   for (const request of state.joinRequests.outgoing) {
-    const joined = state.room?.id === request.room_id;
-    const card = requestCard(
-      formatRoomId(request.room_id),
-      joined ? 'Joined' : request.status
-    );
-    if (request.status === 'accepted' && !joined) {
-      const button = document.createElement('button');
-      button.type = 'button';
-      button.textContent = 'Join room';
-      button.onclick = () => joinAcceptedRoom(request);
-      card.append(button);
-    }
+    list.append(buildOutgoingRequestCard(request, { context: 'room' }));
+  }
+}
+
+function renderLobbyIncomingRequests() {
+  const list = $('lobbyIncomingRequests');
+  if (!list) return;
+  list.innerHTML = '';
+  if (!state.session) {
+    appendHint(list, 'Sign in to receive chat requests from the directory.');
+    return;
+  }
+  const pending = state.joinRequests.directIncoming.filter((request) => request.status === 'pending');
+  if (!pending.length) {
+    appendHint(list, 'No chat requests waiting on you right now.');
+    return;
+  }
+  for (const request of pending) {
+    const card = document.createElement('div');
+    card.className = 'request-card incoming';
+    const heading = document.createElement('strong');
+    heading.textContent = `${request.requester_display_name} wants to chat`;
+    const detail = document.createElement('span');
+    detail.className = 'request-meta';
+    detail.textContent = 'Accept to open a private room for both of you.';
+    const actions = document.createElement('div');
+    actions.className = 'request-card-actions';
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = 'Accept chat';
+    button.onclick = () => acceptDirectChatRequest(request);
+    actions.append(button);
+    card.append(heading, detail, actions);
     list.append(card);
   }
+}
+
+function renderLobbyOutgoingRequests() {
+  const list = $('lobbyOutgoingRequests');
+  if (!list) return;
+  list.innerHTML = '';
+  if (!state.session) {
+    appendHint(list, 'Start a session to request chats or rooms from the directory.');
+    if ($('lobbyRequestsStatus')) {
+      $('lobbyRequestsStatus').textContent = 'Sign in, then use the directory to request chats or rooms.';
+    }
+    return;
+  }
+  const outgoing = [
+    ...state.joinRequests.directOutgoing.map((request) => ({ kind: 'direct', request })),
+    ...state.joinRequests.outgoing.map((request) => ({ kind: 'room', request })),
+  ];
+  if (!outgoing.length) {
+    appendHint(list, 'No sent requests yet. Request a chat or room from the directory below.');
+    if ($('lobbyRequestsStatus')) {
+      $('lobbyRequestsStatus').textContent = 'Browse the directory to request chats with available people or join live rooms.';
+    }
+    return;
+  }
+  if ($('lobbyRequestsStatus')) {
+    $('lobbyRequestsStatus').textContent = 'Open requests update automatically. Join as soon as someone accepts you.';
+  }
+  for (const item of outgoing) {
+    list.append(
+      item.kind === 'direct'
+        ? buildDirectOutgoingRequestCard(item.request, { context: 'lobby' })
+        : buildOutgoingRequestCard(item.request, { context: 'lobby' }),
+    );
+  }
+}
+
+function buildDirectOutgoingRequestCard(request, { context }) {
+  const joined = request.room_id && String(state.room?.id) === String(request.room_id);
+  const card = document.createElement('div');
+  card.className = 'request-card outgoing';
+  const heading = document.createElement('strong');
+  heading.textContent = `Chat with ${request.target_display_name}`;
+  const detail = document.createElement('span');
+  detail.className = 'request-meta';
+  detail.textContent = joined ? 'You are in this chat room' : request.status;
+  const actions = document.createElement('div');
+  actions.className = 'request-card-actions';
+
+  if (request.status === 'accepted' && request.room_id && !joined) {
+    const join = document.createElement('button');
+    join.type = 'button';
+    join.textContent = 'Join chat';
+    join.onclick = () => joinDirectChatRoom(request);
+    actions.append(join);
+  } else if (request.status === 'pending') {
+    const pending = document.createElement('span');
+    pending.className = 'status-pill pending';
+    pending.textContent = 'Waiting for approval';
+    actions.append(pending);
+  }
+
+  card.append(heading, detail, actions);
+  return card;
+}
+
+function buildOutgoingRequestCard(request, { context }) {
+  const joined = String(state.room?.id) === String(request.room_id);
+  const card = document.createElement('div');
+  card.className = `request-card outgoing${context === 'lobby' ? ' lobby-outgoing' : ''}`;
+  const heading = document.createElement('strong');
+  heading.textContent = formatRoomId(request.room_id);
+  const detail = document.createElement('span');
+  detail.className = 'request-meta';
+  detail.textContent = joined ? 'You are in this room' : request.status;
+  const actions = document.createElement('div');
+  actions.className = 'request-card-actions';
+
+  if (request.status === 'accepted' && !joined) {
+    const join = document.createElement('button');
+    join.type = 'button';
+    join.textContent = 'Join room';
+    join.onclick = () => joinAcceptedRoom(request);
+    actions.append(join);
+  } else if (request.status === 'pending') {
+    const pending = document.createElement('span');
+    pending.className = 'status-pill pending';
+    pending.textContent = 'Waiting for approval';
+    actions.append(pending);
+  }
+
+  if (context === 'lobby' && request.status !== 'accepted') {
+    const open = document.createElement('button');
+    open.type = 'button';
+    open.className = 'secondary';
+    open.textContent = 'Open invite page';
+    open.onclick = () => showInviteView(request.room_id);
+    actions.append(open);
+  }
+
+  card.append(heading, detail, actions);
+  return card;
 }
 
 function requestCard(title, meta) {
@@ -972,16 +1516,64 @@ function appendHint(parent, text) {
   parent.append(hint);
 }
 
+async function sendDirectChatRequest(targetSessionId, displayName) {
+  try {
+    requireSession();
+    const { request } = await api('/api/direct-requests', {
+      session_id: state.session.id,
+      target_session_id: targetSessionId,
+    });
+    setRequestStatus(
+      request.status === 'accepted'
+        ? `${displayName} already accepted a chat with you.`
+        : `Chat request sent to ${displayName}.`,
+    );
+    await refreshJoinRequests();
+    await refreshDirectory();
+  } catch (error) {
+    setRequestStatus(error.message);
+  }
+}
+
+async function acceptDirectChatRequest(request) {
+  try {
+    const { request: accepted } = await api(`/api/direct-requests/${request.id}/accept`, {
+      session_id: state.session.id,
+    });
+    setRequestStatus(`Accepted chat with ${accepted.requester_display_name}.`);
+    await refreshJoinRequests();
+    await refreshDirectory();
+    if (accepted.room_id) await joinRoom({ id: accepted.room_id });
+  } catch (error) {
+    setRequestStatus(error.message);
+  }
+}
+
+async function joinDirectChatRoom(request) {
+  try {
+    if (!request.room_id) throw new Error('That chat room is not ready yet.');
+    if (state.room && state.room.id !== request.room_id) await leaveCurrentRoom(false, false);
+    await joinRoom({ id: request.room_id });
+    await updateDirectory();
+    await refreshJoinRequests();
+  } catch (error) {
+    setRequestStatus(error.message);
+  }
+}
+
 async function sendJoinRequest(roomId) {
   try {
     requireSession();
-    if (state.room?.id === roomId) {
+    if (String(state.room?.id) === String(roomId)) {
       setRequestStatus('You are already in that room.');
       renderInviteState();
       return;
     }
     const { request } = await api(`/api/rooms/${roomId}/requests`, { session_id: state.session.id });
-    setRequestStatus(request.status === 'accepted' ? 'Your request was already accepted.' : `Request sent to ${formatRoomId(roomId)}.`);
+    const message = request.status === 'accepted'
+      ? `Your request to ${formatRoomId(roomId)} was already accepted.`
+      : `Request sent to ${formatRoomId(roomId)}. Waiting for approval.`;
+    setRequestStatus(message);
     await refreshJoinRequests();
     await refreshDirectory();
     renderInviteState();
@@ -1033,6 +1625,7 @@ async function leaveCurrentRoom(updateListing = true, navigateHome = true) {
     state.ws.onclose = null;
     state.ws.onerror = null;
   }
+  stopRoomHeartbeat();
   state.ws?.close();
   state.ws = null;
   state.peers.forEach(({ pc }) => pc.close());
@@ -1042,8 +1635,10 @@ async function leaveCurrentRoom(updateListing = true, navigateHome = true) {
   stopLocalMedia();
   state.room = null;
   $('videos').innerHTML = '';
+  $('requestAlert')?.classList.add('hidden');
   updateVideoLayout();
   renderParticipants();
+  updateRequestIndicators();
   showLobbyView();
   if (navigateHome && location.pathname !== '/') history.pushState({}, '', '/');
   $('addRandomButton').disabled = true;
@@ -1063,13 +1658,20 @@ async function signin(emailId, passwordId) {
   setSession((await api('/api/auth/signin', { email: $(emailId).value, password: $(passwordId).value })).session);
 }
 
-async function runAuth(action, statusId = 'authStatus') {
+async function runAuth(action, statusId = 'authStatus', displayNameId = null) {
   try {
     $(statusId).textContent = 'Working...';
     await action();
   } catch (error) {
     $(statusId).textContent = error.message;
     if (statusId !== 'authStatus') $('authStatus').textContent = error.message;
+    if (
+      displayNameId
+      && $(displayNameId)
+      && /already in use|registered account/i.test(error.message)
+    ) {
+      $(displayNameId).value = randomDisplayName();
+    }
   }
 }
 
@@ -1079,12 +1681,13 @@ async function signout() {
   if (sessionId) await api('/api/auth/signout', { session_id: sessionId }).catch(console.warn);
   clearSession('Signed out.');
   renderInviteState();
+  await refreshDirectory().catch(console.warn);
 }
 
-$('guestButton').onclick = async () => runAuth(() => startGuest('displayName'));
+$('guestButton').onclick = async () => runAuth(() => startGuest('displayName'), 'authStatus', 'displayName');
 $('signupButton').onclick = async () => runAuth(() => signup('displayName', 'email', 'password'));
 $('signinButton').onclick = async () => runAuth(() => signin('email', 'password'));
-$('inviteGuestButton').onclick = async () => runAuth(() => startGuest('inviteDisplayName'), 'inviteStatus');
+$('inviteGuestButton').onclick = async () => runAuth(() => startGuest('inviteDisplayName'), 'inviteStatus', 'inviteDisplayName');
 $('inviteSignupButton').onclick = async () => runAuth(() => signup('inviteDisplayName', 'inviteEmail', 'invitePassword'), 'inviteStatus');
 $('inviteSigninButton').onclick = async () => runAuth(() => signin('inviteEmail', 'invitePassword'), 'inviteStatus');
 $('logoutButton').onclick = signout;
@@ -1104,7 +1707,7 @@ $('startRoomButton').onclick = async () => {
     setLaunchStatus('Finding a room...');
     const { room } = await api('/api/rooms/random', {
       session_id: state.session.id,
-      size: Number($('roomSize').value || 2),
+      size: clampRoomSize(),
       host_controls_joiners: $('hostControls').checked,
       share_link_enabled: $('shareLinks').checked,
     });
@@ -1152,7 +1755,18 @@ $('tabRequests').onclick = () => setActivePanel('requests');
 $('tabSettings').onclick = () => setActivePanel('settings');
 $('chatToggleButton').onclick = () => setActivePanel('chat');
 $('peopleToggleButton').onclick = () => setActivePanel('people');
+$('requestsToggleButton').onclick = () => setActivePanel('requests');
+$('pendingRequestsChip')?.addEventListener('click', () => setActivePanel('requests'));
 $('settingsToggleButton').onclick = () => setActivePanel('settings');
+for (const button of document.querySelectorAll('.filter-chip')) {
+  button.addEventListener('click', () => {
+    state.directoryFilter = button.dataset.filter || 'all';
+    for (const chip of document.querySelectorAll('.filter-chip')) {
+      chip.classList.toggle('active', chip === button);
+    }
+    refreshDirectory().catch(console.warn);
+  });
+}
 $('cameraSelect').onchange = (event) => changeDevice('video', event.target.value);
 $('microphoneSelect').onchange = (event) => changeDevice('audio', event.target.value);
 $('mirrorSelfToggle').onchange = (event) => {
@@ -1172,7 +1786,12 @@ $('chatForm').onsubmit = (event) => {
   $('chatInput').value = '';
 };
 $('directoryOptIn').onchange = updateDirectory;
+$('roomSize')?.addEventListener('input', (event) => clampRoomSize(event.target.value));
+$('roomSize')?.addEventListener('change', (event) => clampRoomSize(event.target.value));
+$('roomSize')?.addEventListener('blur', (event) => clampRoomSize(event.target.value));
 window.addEventListener('beforeunload', () => {
+  stopRoomHeartbeat();
+  stopStatsHeartbeat();
   stopLocalMedia();
   if (state.session) navigator.sendBeacon('/api/directory', new Blob([JSON.stringify({ session_id: state.session.id, display_name: state.session.display_name, room_id: null, available: false })], { type: 'application/json' }));
 });
@@ -1191,6 +1810,10 @@ window.addEventListener('popstate', () => {
   }
 });
 
+populateDisplayNameFields();
+updateAuthFormState();
+clampRoomSize();
+connectStatsWs();
 if (state.pendingRoomId) showInviteView(state.pendingRoomId, true);
 else showLobbyView();
 setRequestStatus();
