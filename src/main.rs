@@ -143,6 +143,7 @@ struct DirectChatRequest {
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     accepted_by: Option<Uuid>,
+    consumed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
@@ -365,7 +366,9 @@ struct DirectChatRequestSummary {
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     accepted_by: Option<Uuid>,
+    consumed_at: Option<DateTime<Utc>>,
     can_accept: bool,
+    can_join: bool,
 }
 
 #[derive(Serialize)]
@@ -439,6 +442,10 @@ fn build_router_with_app(app: App) -> Router {
         .route(
             "/api/direct-requests/:request_id/accept",
             post(accept_direct_chat_request),
+        )
+        .route(
+            "/api/direct-requests/:request_id/join",
+            post(join_direct_chat_request),
         )
         .route("/api/directory", get(list_directory).post(upsert_directory))
         .route("/ws/stats", get(stats_ws))
@@ -734,7 +741,7 @@ async fn list_join_requests(
         .values()
         .filter(|request| request.status == JoinRequestStatus::Pending)
         .filter(|request| request.target_session == query.session_id)
-        .map(|request| direct_chat_request_summary(request, query.session_id))
+        .map(|request| direct_chat_request_summary(&state, request, query.session_id))
         .collect();
     direct_incoming.sort_by(|a, b| a.created_at.cmp(&b.created_at));
 
@@ -742,7 +749,11 @@ async fn list_join_requests(
         .direct_chat_requests
         .values()
         .filter(|request| request.requester_session == query.session_id)
-        .map(|request| direct_chat_request_summary(request, query.session_id))
+        .filter(|request| {
+            request.status == JoinRequestStatus::Pending
+                || direct_chat_request_can_join(&state, request, query.session_id)
+        })
+        .map(|request| direct_chat_request_summary(&state, request, query.session_id))
         .collect();
     direct_outgoing.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
 
@@ -846,7 +857,7 @@ async fn create_direct_chat_request(
             && request.status == JoinRequestStatus::Pending
     }) {
         return Ok(Json(DirectChatRequestResponse {
-            request: direct_chat_request_summary(existing, payload.session_id),
+            request: direct_chat_request_summary(&state, existing, payload.session_id),
         }));
     }
 
@@ -872,12 +883,13 @@ async fn create_direct_chat_request(
         created_at: now,
         updated_at: now,
         accepted_by: None,
+        consumed_at: None,
     };
     let request_id = request.id;
     state.direct_chat_requests.insert(request_id, request);
     let request = state.direct_chat_requests.get(&request_id).unwrap();
     Ok(Json(DirectChatRequestResponse {
-        request: direct_chat_request_summary(request, payload.session_id),
+        request: direct_chat_request_summary(&state, request, payload.session_id),
     }))
 }
 
@@ -938,7 +950,54 @@ async fn accept_direct_chat_request(
 
     let request = state.direct_chat_requests.get(&request_id).unwrap();
     Ok(Json(DirectChatRequestResponse {
-        request: direct_chat_request_summary(request, payload.session_id),
+        request: direct_chat_request_summary(&state, request, payload.session_id),
+    }))
+}
+
+async fn join_direct_chat_request(
+    State(app): State<App>,
+    Path(request_id): Path<Uuid>,
+    Json(payload): Json<JoinRoomRequest>,
+) -> Result<Json<DirectChatRequestResponse>, ApiError> {
+    let mut state = app.state.lock().await;
+    ensure_session(&state, payload.session_id)?;
+
+    let request = state
+        .direct_chat_requests
+        .get(&request_id)
+        .ok_or_else(|| ApiError::not_found("Chat request not found."))?
+        .clone();
+    if request.requester_session != payload.session_id {
+        return Err(ApiError::forbidden(
+            "Only the requester can use this chat join action.",
+        ));
+    }
+    if request.status != JoinRequestStatus::Accepted {
+        return Err(ApiError::conflict(
+            "That chat request is not ready to join.",
+        ));
+    }
+    if request.consumed_at.is_some() {
+        return Err(ApiError::conflict("That chat join link was already used."));
+    }
+    let Some(room_id) = request.room_id else {
+        return Err(ApiError::conflict("That chat room is not ready yet."));
+    };
+    if !state.rooms.contains_key(&room_id) {
+        if let Some(request) = state.direct_chat_requests.get_mut(&request_id) {
+            request.consumed_at = Some(Utc::now());
+            request.updated_at = Utc::now();
+        }
+        return Err(ApiError::conflict("That chat room is no longer available."));
+    }
+
+    if let Some(request) = state.direct_chat_requests.get_mut(&request_id) {
+        request.consumed_at = Some(Utc::now());
+        request.updated_at = Utc::now();
+    }
+    let request = state.direct_chat_requests.get(&request_id).unwrap();
+    Ok(Json(DirectChatRequestResponse {
+        request: direct_chat_request_summary(&state, request, payload.session_id),
     }))
 }
 
@@ -1106,6 +1165,7 @@ async fn handle_socket(state: SharedState, room_id: Uuid, session_id: Uuid, sock
             room.senders.insert(session_id, tx.clone());
             room.connection_ids.insert(session_id, connection_id);
         }
+        consume_direct_chat_for_room(&mut locked, room_id, session_id);
         broadcast_stats(&mut locked);
         if let Ok(snapshot) = room_snapshot(&locked, room_id) {
             let _ = tx.send(ServerWsEvent::Welcome {
@@ -1493,7 +1553,43 @@ fn directory_entries(state: &AppState) -> Vec<DirectoryEntry> {
     entries
 }
 
+fn direct_chat_request_can_join(
+    state: &AppState,
+    request: &DirectChatRequest,
+    viewer_session: Uuid,
+) -> bool {
+    request.status == JoinRequestStatus::Accepted
+        && request.requester_session == viewer_session
+        && request.consumed_at.is_none()
+        && request
+            .room_id
+            .is_some_and(|room_id| state.rooms.contains_key(&room_id))
+}
+
+fn consume_direct_chat_for_room(state: &mut AppState, room_id: Uuid, session_id: Uuid) {
+    for request in state.direct_chat_requests.values_mut() {
+        if request.requester_session == session_id
+            && request.room_id == Some(room_id)
+            && request.status == JoinRequestStatus::Accepted
+            && request.consumed_at.is_none()
+        {
+            request.consumed_at = Some(Utc::now());
+            request.updated_at = Utc::now();
+        }
+    }
+}
+
+fn expire_direct_chat_requests_for_room(state: &mut AppState, room_id: Uuid) {
+    for request in state.direct_chat_requests.values_mut() {
+        if request.room_id == Some(room_id) && request.consumed_at.is_none() {
+            request.consumed_at = Some(Utc::now());
+            request.updated_at = Utc::now();
+        }
+    }
+}
+
 fn direct_chat_request_summary(
+    state: &AppState,
     request: &DirectChatRequest,
     viewer_session: Uuid,
 ) -> DirectChatRequestSummary {
@@ -1508,8 +1604,10 @@ fn direct_chat_request_summary(
         created_at: request.created_at,
         updated_at: request.updated_at,
         accepted_by: request.accepted_by,
+        consumed_at: request.consumed_at,
         can_accept: request.status == JoinRequestStatus::Pending
             && request.target_session == viewer_session,
+        can_join: direct_chat_request_can_join(state, request, viewer_session),
     }
 }
 
@@ -1663,6 +1761,7 @@ fn remove_room_connection(
         state
             .join_requests
             .retain(|_, request| request.room_id != room_id);
+        expire_direct_chat_requests_for_room(state, room_id);
     } else if let Ok(snapshot) = room_snapshot(state, room_id) {
         broadcast(
             state,
@@ -2226,6 +2325,122 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["request"]["status"], "accepted");
         assert!(payload["request"]["room_id"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn direct_chat_join_is_one_time_and_disappears_from_outgoing() {
+        let app = test_app();
+        let router = build_router_with_app(app.clone());
+        let requester = create_session(&app, "Requester".into(), None)
+            .await
+            .unwrap();
+        let target = create_session(&app, "Target".into(), None).await.unwrap();
+        {
+            let mut locked = app.state.lock().await;
+            locked.directory.insert(
+                target.id,
+                DirectoryEntry {
+                    session_id: target.id,
+                    display_name: "Target".into(),
+                    room_id: None,
+                    available: true,
+                    updated_at: Utc::now(),
+                },
+            );
+            register_presence(&mut locked, target.id, PresenceConnectionKind::Stats);
+            register_presence(&mut locked, requester.id, PresenceConnectionKind::Stats);
+        }
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/direct-requests")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "session_id": requester.id,
+                            "target_session_id": target.id
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let request_id = payload["request"]["id"].as_str().unwrap().to_string();
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/direct-requests/{request_id}/accept"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "session_id": target.id }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/join-requests?session_id={}", requester.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["direct_outgoing"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["direct_outgoing"][0]["can_join"], true);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/direct-requests/{request_id}/join"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "session_id": requester.id }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["request"]["can_join"], false);
+        assert!(payload["request"]["consumed_at"].as_str().is_some());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/join-requests?session_id={}", requester.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(payload["direct_outgoing"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

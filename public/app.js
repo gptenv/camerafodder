@@ -1012,8 +1012,22 @@ function outgoingRequestForRoom(roomId) {
 
 function directRequestForTarget(targetSessionId) {
   return state.joinRequests.directOutgoing.find(
-    (request) => String(request.target_session ?? request.targetSession) === String(targetSessionId),
+    (request) => String(request.target_session ?? request.targetSession) === String(targetSessionId)
+      && directRequestIsActive(request),
   );
+}
+
+function directRequestCanJoin(request) {
+  return Boolean(
+    (request.can_join ?? request.canJoin)
+      && request.status === 'accepted'
+      && request.room_id
+      && !(request.consumed_at ?? request.consumedAt),
+  );
+}
+
+function directRequestIsActive(request) {
+  return request.status === 'pending' || directRequestCanJoin(request);
 }
 
 function normalizeJoinRequests(payload) {
@@ -1408,7 +1422,9 @@ function renderLobbyOutgoingRequests() {
     return;
   }
   const outgoing = [
-    ...state.joinRequests.directOutgoing.map((request) => ({ kind: 'direct', request })),
+    ...state.joinRequests.directOutgoing
+      .filter(directRequestIsActive)
+      .map((request) => ({ kind: 'direct', request })),
     ...state.joinRequests.outgoing.map((request) => ({ kind: 'room', request })),
   ];
   if (!outgoing.length) {
@@ -1442,7 +1458,7 @@ function buildDirectOutgoingRequestCard(request, { context }) {
   const actions = document.createElement('div');
   actions.className = 'request-card-actions';
 
-  if (request.status === 'accepted' && request.room_id && !joined) {
+  if (directRequestCanJoin(request) && !joined) {
     const join = document.createElement('button');
     join.type = 'button';
     join.textContent = 'Join chat';
@@ -1553,11 +1569,20 @@ async function joinDirectChatRoom(request) {
   try {
     if (!request.room_id) throw new Error('That chat room is not ready yet.');
     if (state.room && state.room.id !== request.room_id) await leaveCurrentRoom(false, false);
-    await joinRoom({ id: request.room_id });
+    const { request: consumed } = await api(`/api/direct-requests/${request.id}/join`, {
+      session_id: state.session.id,
+    });
+    const roomId = consumed.room_id || request.room_id;
+    state.joinRequests.directOutgoing = state.joinRequests.directOutgoing.filter(
+      (candidate) => candidate.id !== request.id,
+    );
+    renderJoinRequests();
+    await joinRoom({ id: roomId });
     await updateDirectory();
     await refreshJoinRequests();
   } catch (error) {
     setRequestStatus(error.message);
+    await refreshJoinRequests().catch(console.warn);
   }
 }
 
